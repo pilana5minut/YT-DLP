@@ -5,6 +5,8 @@
 # Разработано для Linux Fedora 44 (GNOME). Ссылка передается аргументом.
 # ==============================================================================
 
+set -o pipefail
+
 # 1. ПРОВЕРКА АРГУМЕНТОВ КОМАНДНОЙ СТРОКИ
 PLAYLIST_URL="$1"
 
@@ -66,31 +68,257 @@ echo -e " Элементы плейлиста сохраняются в: $MUSIC_
 echo -e " Логи и архив сохраняются в: $SERVICE_DIR"
 echo -e "================================================================================\n"
 
+print_intermediate_report() {
+    local log_file="$1"
+    local archive_file="$2"
+    local before_count="$3"
+    local report_name="${4:-ПРОМЕЖУТОЧНЫЙ ОТЧЕТ СЕАНСА}"
+    local progress_tmp=".progress_summary.tmp"
+
+    grep ">>> \[ГОТОВО\]" "$log_file" 2>/dev/null | sed "s/.*>>> \[ГОТОВО\] //" | sed -e 's/[[:space:]]*$//' > "$progress_tmp"
+
+    local downloaded_count=$(wc -l < "$progress_tmp" | tr -d ' ')
+    local after_count=$(wc -l < "$archive_file" 2>/dev/null | tr -d ' ')
+    local new_archive_count=$((after_count - before_count))
+    if [ "$new_archive_count" -gt "$downloaded_count" ]; then
+        local real_new_count=$new_archive_count
+    else
+        local real_new_count=$downloaded_count
+    fi
+
+    local deleted_count=$(grep -E 'ERROR: \[youtube\].*(Video unavailable|not made this video available in your country|blocked due to the claimed content|no longer available because|This video is not available|This video is no longer available|This video is not available in your country)' "$log_file" 2>/dev/null | wc -l | tr -d ' ')
+    local restricted_count=$(grep -E "ERROR: \[youtube\].*(Private video|Sign in if you've been granted access)" "$log_file" 2>/dev/null | wc -l | tr -d ' ')
+    local total_items=$(grep -oE "Downloading [0-9]+ items" "$log_file" | tail -n 1 | awk '{print $2}')
+
+    local skipped_count=0
+    if [ -z "$total_items" ]; then
+        total_items=$((before_count + real_new_count + deleted_count + restricted_count))
+        skipped_count=$before_count
+    else
+        skipped_count=$((total_items - real_new_count - deleted_count - restricted_count))
+        if [ "$skipped_count" -lt 0 ]; then skipped_count=0; fi
+    fi
+
+    echo -e "\n================================================================================"
+    echo -e " $report_name"
+    echo -e "================================================================================"
+    echo -e "${COLOR_SKIP} Количество пропущенных элементов плейлиста: $skipped_count${COLOR_RESET}"
+    echo -e "--------------------------------------------------------------------------------"
+    echo -e "${COLOR_DELETED} Количество удаленных и скрытых элементов плейлиста: $deleted_count${COLOR_RESET}"
+    echo -e "--------------------------------------------------------------------------------"
+    echo -e "${COLOR_RESTRICTED} Количество элементов плейлиста с ограниченным доступом: $restricted_count${COLOR_RESET}"
+    echo -e "--------------------------------------------------------------------------------"
+    echo -e "${COLOR_DOWNLOADED} Всего элементов плейлиста скачано за текущий сеанс: $real_new_count${COLOR_RESET}"
+    echo -e "--------------------------------------------------------------------------------"
+
+    rm -f "$progress_tmp"
+}
+
+monitor_download_progress() {
+    local last_reported=0
+
+    while kill -0 "$YT_PID" 2>/dev/null; do
+        local current_downloaded
+        current_downloaded=$(grep -c ">>> \[ГОТОВО\]" "$LOG_FILE" 2>/dev/null || true)
+        current_downloaded=${current_downloaded//[[:space:]]/}
+        current_downloaded=${current_downloaded:-0}
+
+        if [ "$current_downloaded" -ge $((last_reported + 10)) ]; then
+            last_reported=$((current_downloaded / 10 * 10))
+            print_intermediate_report "$LOG_FILE" "$ARCHIVE_FILE" "$BEFORE_COUNT" "ПРОМЕЖУТОЧНЫЙ ОТЧЕТ СЕАНСА"
+        fi
+
+        sleep 2
+    done
+
+    local final_downloaded
+    final_downloaded=$(grep -c ">>> \[ГОТОВО\]" "$LOG_FILE" 2>/dev/null || true)
+    final_downloaded=${final_downloaded//[[:space:]]/}
+    final_downloaded=${final_downloaded:-0}
+
+    if [ "$final_downloaded" -gt "$last_reported" ] && [ $((final_downloaded % 10)) -ne 0 ]; then
+        print_intermediate_report "$LOG_FILE" "$ARCHIVE_FILE" "$BEFORE_COUNT" "ПРОМЕЖУТОЧНЫЙ ОТЧЕТ СЕАНСА"
+    fi
+}
+
+cleanup_and_exit() {
+    local signal_name="${1:-INT}"
+
+    echo -e "\n================================================================================"
+    echo -e " Прерывание работы по Ctrl+C. Синхронизация остановлена."
+    echo -e "================================================================================\n"
+
+    if [ -n "${YT_PID:-}" ] && kill -0 "$YT_PID" 2>/dev/null; then
+        kill -INT "$YT_PID" 2>/dev/null || kill -TERM "$YT_PID" 2>/dev/null || true
+    fi
+
+    if [ -n "${TAIL_PID:-}" ] && kill -0 "$TAIL_PID" 2>/dev/null; then
+        kill "$TAIL_PID" 2>/dev/null || true
+    fi
+
+    if [ -n "${MONITOR_PID:-}" ] && kill -0 "$MONITOR_PID" 2>/dev/null; then
+        kill "$MONITOR_PID" 2>/dev/null || true
+    fi
+
+    exit 130
+}
+
+trap 'cleanup_and_exit INT' INT
+trap 'cleanup_and_exit TERM' TERM
+
 # 3. ЗАПУСК YT-DLP
-yt-dlp \
-  --extract-audio \
-  --audio-format mp3 \
-  --audio-quality 0 \
-  --yes-playlist \
-  --download-archive "$ARCHIVE_FILE" \
-  --cookies-from-browser "$BROWSER" \
-  --restrict-filenames \
-  --js-runtimes node \
-  --remote-components ejs:github \
-  --socket-timeout 60 \
-  --retries 10 \
-  --file-access-retries 5 \
-  --fragment-retries 10 \
-  --extractor-args "youtubetab:skip=authcheck" \
-  --http-chunk-size 10M \
-  --paths "$MUSIC_DIR" \
-  --output "%(title)s [%(id)s].%(ext)s" \
-  --ignore-errors \
-  --console-title \
-  --progress \
-  --print "before_dl:>>> [СКАЧИВАНИЕ] %(title)s" \
-  --print "after_move:>>> [ГОТОВО] %(title)s" \
-  "$PLAYLIST_URL" 2>&1 | tee "$LOG_FILE"
+# Надёжный вариант: обёртка на Python, которая показывает live-вывод,
+# считает готовые треки, печатает промежуточный отчёт каждые 10 и
+# корректно обрабатывает Ctrl+C без докачивания полного плейлиста.
+
+python3 - "$PLAYLIST_URL" "$LOG_FILE" "$ARCHIVE_FILE" "$BEFORE_COUNT" "$MUSIC_DIR" "$BROWSER" <<'PY'
+import os, sys, subprocess, signal, re
+
+playlist_url, log_file, archive_file, before_count_str, music_dir, browser = sys.argv[1:7]
+before_count = int(before_count_str)
+
+
+def report_stats(log_path, archive_path, before_total):
+    names = []
+    if os.path.exists(log_path):
+        with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                if '>>> [ГОТОВО]' in line:
+                    names.append(line.split('>>> [ГОТОВО] ', 1)[1].strip())
+
+    downloaded_count = len(names)
+    if os.path.exists(archive_path):
+        with open(archive_path, 'r', encoding='utf-8', errors='replace') as f:
+            after_count = sum(1 for line in f if line.strip())
+    else:
+        after_count = 0
+
+    real_new_count = max(after_count - before_total, downloaded_count)
+
+    deleted_count = 0
+    restricted_count = 0
+    if os.path.exists(log_path):
+        with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                if 'ERROR: [youtube]' in line:
+                    if re.search(r'(Video unavailable|not made this video available in your country|blocked due to the claimed content|no longer available because|This video is not available|This video is no longer available|This video is not available in your country)', line):
+                        deleted_count += 1
+                    if re.search(r'(Private video|Sign in if you\'ve been granted access)', line):
+                        restricted_count += 1
+
+    total_items = 0
+    if os.path.exists(log_path):
+        with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                m = re.search(r'Downloading\s+(\d+)\s+items', line)
+                if m:
+                    total_items = int(m.group(1))
+
+    if total_items:
+        skipped_count = max(total_items - real_new_count - deleted_count - restricted_count, 0)
+    else:
+        skipped_count = before_total
+
+    print('\n' + '=' * 80)
+    print(' ПРОМЕЖУТОЧНЫЙ ОТЧЕТ СЕАНСА')
+    print('=' * 80)
+    print(f' Количество пропущенных элементов плейлиста: {skipped_count}')
+    print('-' * 80)
+    print(f' Количество удаленных и скрытых элементов плейлиста: {deleted_count}')
+    print('-' * 80)
+    print(f' Количество элементов плейлиста с ограниченным доступом: {restricted_count}')
+    print('-' * 80)
+    print(f' Всего элементов плейлиста скачано за текущий сеанс: {real_new_count}')
+    print('-' * 80)
+    print('')
+
+
+cmd = [
+    'yt-dlp',
+    '--extract-audio',
+    '--audio-format', 'mp3',
+    '--audio-quality', '0',
+    '--yes-playlist',
+    '--download-archive', archive_file,
+    '--cookies-from-browser', browser,
+    '--restrict-filenames',
+    '--js-runtimes', 'node',
+    '--remote-components', 'ejs:github',
+    '--socket-timeout', '60',
+    '--retries', '10',
+    '--file-access-retries', '5',
+    '--fragment-retries', '10',
+    '--extractor-args', 'youtubetab:skip=authcheck',
+    '--http-chunk-size', '10M',
+    '--paths', music_dir,
+    '--output', '%(title)s [%(id)s].%(ext)s',
+    '--ignore-errors',
+    '--console-title',
+    '--progress',
+    '--print', 'before_dl:>>> [СКАЧИВАНИЕ] %(title)s',
+    '--print', 'after_move:>>> [ГОТОВО] %(title)s',
+    playlist_url,
+]
+
+log_handle = open(log_file, 'wb', buffering=0)
+proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
+
+last_reported = 0
+finished_count = 0
+
+
+def stop_child(signum, frame):
+    try:
+        proc.send_signal(signal.SIGINT)
+    except ProcessLookupError:
+        pass
+    raise SystemExit(130)
+
+
+signal.signal(signal.SIGINT, stop_child)
+signal.signal(signal.SIGTERM, stop_child)
+
+try:
+    while True:
+        chunk = proc.stdout.readline()
+        if not chunk:
+            break
+        text = chunk.decode('utf-8', errors='replace')
+        sys.stdout.write(text)
+        sys.stdout.flush()
+        log_handle.write(chunk)
+        log_handle.flush()
+
+        if '>>> [ГОТОВО]' in text:
+            finished_count += 1
+            if finished_count >= last_reported + 10:
+                last_reported = (finished_count // 10) * 10
+                report_stats(log_file, archive_file, before_count)
+
+    rc = proc.wait()
+    if rc != 0 and rc != 130:
+        raise SystemExit(rc)
+    if rc == 130:
+        raise SystemExit(130)
+except SystemExit:
+    raise
+except KeyboardInterrupt:
+    stop_child(signal.SIGINT, None)
+finally:
+    try:
+        log_handle.close()
+    except Exception:
+        pass
+
+PY
+YT_EXIT=$?
+
+if [ "$YT_EXIT" -eq 130 ]; then
+    echo -e "\n================================================================================"
+    echo -e " Прерывание работы по Ctrl+C. Синхронизация остановлена."
+    echo -e "================================================================================\n"
+    exit 130
+fi
 
 # 4. АНАЛИЗ И МАТЕМАТИЧЕСКИЙ РАСЧЕТ ОТЧЕТА
 echo -e "\n================================================================================"
