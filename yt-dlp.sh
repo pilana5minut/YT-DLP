@@ -172,6 +172,33 @@ monitor_download_progress() {
     fi
 }
 
+cleanup_incomplete_webm() {
+    local file_name video_id removed_count=0
+
+    if [ ! -d "$MUSIC_DIR" ]; then
+        return
+    fi
+
+    while IFS= read -r -d '' file_name; do
+        video_id=$(basename "$file_name" | grep -oE '\[[A-Za-z0-9_-]{11}\]' | tail -n 1 | tr -d '[]')
+
+        # Файлы без распознаваемого ID в имени не трогаем — не относятся к загрузкам плейлиста
+        if [ -z "$video_id" ]; then
+            continue
+        fi
+
+        # ID есть в архиве только если загрузка и конвертация завершились успешно
+        if ! grep -qF " $video_id" "$ARCHIVE_FILE" 2>/dev/null; then
+            rm -f "$file_name"
+            removed_count=$((removed_count + 1))
+        fi
+    done < <(find "$MUSIC_DIR" -maxdepth 1 -type f -print0 2>/dev/null)
+
+    if [ "$removed_count" -gt 0 ]; then
+        echo -e "${COLOR_DELETED} Удалено файлов от незавершенных/повреждённых загрузок: $removed_count${COLOR_RESET}"
+    fi
+}
+
 cleanup_and_exit() {
     local signal_name="${1:-INT}"
 
@@ -190,6 +217,8 @@ cleanup_and_exit() {
     if [ -n "${MONITOR_PID:-}" ] && kill -0 "$MONITOR_PID" 2>/dev/null; then
         kill "$MONITOR_PID" 2>/dev/null || true
     fi
+
+    cleanup_incomplete_webm
 
     exit 130
 }
@@ -352,6 +381,7 @@ if [ "$YT_EXIT" -eq 130 ]; then
     echo -e "\n================================================================================"
     echo -e "${COLOR_DELETED} Прерывание работы по Ctrl+C. Синхронизация плейлиста: $PLAYLIST_NAME была остановлена.${COLOR_RESET}"
     echo -e "================================================================================\n"
+    cleanup_incomplete_webm
     exit 130
 fi
 
@@ -461,6 +491,8 @@ fi
 
 # Удаляем временный скрытый файл
 rm -f .downloaded_names.tmp "$PROBLEMATIC_LIST_FILE"
+
+cleanup_incomplete_webm
 
 echo -e "================================================================================"
 echo -e "${COLOR_DOWNLOADED} Синхронизация плейлиста: $PLAYLIST_NAME полностью завершена.${COLOR_RESET}"
