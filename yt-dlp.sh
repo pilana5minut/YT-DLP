@@ -226,19 +226,29 @@ cleanup_and_exit() {
 trap 'cleanup_and_exit INT' INT
 trap 'cleanup_and_exit TERM' TERM
 
+DOWNLOAD_START_TIME=$(date +%s)
+
 # 3. ЗАПУСК YT-DLP
 # Надёжный вариант: обёртка на Python, которая показывает live-вывод,
 # считает готовые треки, печатает промежуточный отчёт каждые 10 и
 # корректно обрабатывает Ctrl+C без докачивания полного плейлиста.
 
-python3 - "$PLAYLIST_URL" "$LOG_FILE" "$ARCHIVE_FILE" "$BEFORE_COUNT" "$MUSIC_DIR" "$BROWSER" "$PLAYLIST_NAME" <<'PY'
-import os, sys, subprocess, signal, re
+python3 - "$PLAYLIST_URL" "$LOG_FILE" "$ARCHIVE_FILE" "$BEFORE_COUNT" "$MUSIC_DIR" "$BROWSER" "$PLAYLIST_NAME" "$DOWNLOAD_START_TIME" <<'PY'
+import os, sys, subprocess, signal, re, time
+from yt_dlp import YoutubeDL, parse_options
 
-playlist_url, log_file, archive_file, before_count_str, music_dir, browser, playlist_name = sys.argv[1:8]
+playlist_url, log_file, archive_file, before_count_str, music_dir, browser, playlist_name, start_time_str = sys.argv[1:9]
 before_count = int(before_count_str)
+start_time = int(start_time_str)
 
 
-def report_stats(log_path, archive_path, before_total):
+def format_duration(total_seconds):
+    hours, remainder = divmod(int(total_seconds), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f'{hours:02d}:{minutes:02d}:{seconds:02d}'
+
+
+def report_stats(log_path, archive_path, before_total, sync_start_time):
     names = []
     if os.path.exists(log_path):
         with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
@@ -279,19 +289,18 @@ def report_stats(log_path, archive_path, before_total):
     else:
         skipped_count = before_total
 
-    print('\n' + '=' * 80)
     report_color = '\033[38;2;37;230;230m' if sys.stdout.isatty() else ''
     reset_color = '\033[0m' if sys.stdout.isatty() else ''
+    print('\n' + f'{report_color}{"=" * 80}{reset_color}')
     print(f'{report_color} ПРОМЕЖУТОЧНЫЙ ОТЧЕТ СИНХРОНИЗАЦИИ ПЛЕЙЛИСТА: {playlist_name}{reset_color}')
-    print('=' * 80)
+    print(f'{report_color}{"=" * 80}{reset_color}')
     print(f' Количество пропущенных элементов плейлиста: {skipped_count}')
-    print('-' * 80)
     print(f' Количество удаленных и скрытых элементов плейлиста: {deleted_count}')
-    print('-' * 80)
     print(f' Количество элементов плейлиста с ограниченным доступом: {restricted_count}')
+    print(f' Всего элементов плейлиста скачано на текущий момент: {real_new_count}')
     print('-' * 80)
-    print(f' Всего элементов плейлиста скачано за текущий сеанс: {real_new_count}')
-    print('-' * 80)
+    print(f' Времени затрачено: {format_duration(time.time() - sync_start_time)}')
+    print(f'{report_color}{"=" * 80}{reset_color}')
     print('')
 
 
@@ -324,16 +333,55 @@ cmd = [
     playlist_url,
 ]
 
-log_handle = open(log_file, 'wb', buffering=0)
-proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
+_, ydl_options, urls, ydl_params = parse_options(cmd[1:])
+state = {'finished_count': 0, 'last_reported': 0}
 
-last_reported = 0
-finished_count = 0
 
+def progress_hook(status):
+    if status.get('status') != 'finished':
+        return
+
+    state['finished_count'] += 1
+    if state['finished_count'] >= state['last_reported'] + 10:
+        state['last_reported'] = (state['finished_count'] // 10) * 10
+        log_handle.flush()
+        report_stats(log_file, archive_file, before_count, start_time)
+
+
+ydl_params['progress_hooks'] = [progress_hook]
+ydl_params['quiet'] = False
+ydl_params['no_warnings'] = False
+
+log_handle = open(log_file, 'w', encoding='utf-8', buffering=1)
+
+
+class OutputLogger:
+    terminal_patterns = (
+        re.compile(r'^\[download\] Downloading item '),
+        re.compile(r'^>>> \[(СКАЧИВАНИЕ|ГОТОВО)\]'),
+        re.compile(r'^\[ExtractAudio\] Destination:'),
+    )
+
+    def _write(self, message):
+        text = str(message)
+        log_handle.write(text + '\n')
+        log_handle.flush()
+        if any(pattern.search(text) for pattern in self.terminal_patterns):
+            sys.stdout.write(text + '\n')
+            sys.stdout.flush()
+
+    debug = _write
+    info = _write
+    warning = _write
+    error = _write
+
+
+ydl_params['logger'] = OutputLogger()
+ydl = YoutubeDL(ydl_params)
 
 def stop_child(signum, frame):
     try:
-        proc.send_signal(signal.SIGINT)
+        ydl._exit_status = 130
     except ProcessLookupError:
         pass
     raise SystemExit(130)
@@ -343,27 +391,9 @@ signal.signal(signal.SIGINT, stop_child)
 signal.signal(signal.SIGTERM, stop_child)
 
 try:
-    while True:
-        chunk = proc.stdout.readline()
-        if not chunk:
-            break
-        text = chunk.decode('utf-8', errors='replace')
-        sys.stdout.write(text)
-        sys.stdout.flush()
-        log_handle.write(chunk)
-        log_handle.flush()
-
-        if '>>> [ГОТОВО]' in text:
-            finished_count += 1
-            if finished_count >= last_reported + 10:
-                last_reported = (finished_count // 10) * 10
-                report_stats(log_file, archive_file, before_count)
-
-    rc = proc.wait()
-    if rc != 0 and rc != 130:
-        raise SystemExit(rc)
-    if rc == 130:
-        raise SystemExit(130)
+    exit_code = ydl.download(urls)
+    if exit_code not in (None, 0):
+        raise SystemExit(exit_code)
 except SystemExit:
     raise
 except KeyboardInterrupt:
@@ -373,7 +403,6 @@ finally:
         log_handle.close()
     except Exception:
         pass
-
 PY
 YT_EXIT=$?
 
@@ -386,10 +415,6 @@ if [ "$YT_EXIT" -eq 130 ]; then
 fi
 
 # 4. АНАЛИЗ И МАТЕМАТИЧЕСКИЙ РАСЧЕТ ОТЧЕТА
-echo -e "\n================================================================================"
-echo -e "${COLOR_REPORT_FINAL} ИТОГОВЫЙ ОТЧЕТ СИНХРОНИЗАЦИИ ПЛЕЙЛИСТА: $PLAYLIST_NAME${COLOR_RESET}"
-echo -e "================================================================================"
-
 # Извлекаем чистые названия скачанных треков из лога
 grep ">>> \[ГОТОВО\]" "$LOG_FILE" | sed "s/.*>>> \[ГОТОВО\] //" | sed -e 's/[[:space:]]*$//' > .downloaded_names.tmp
 
@@ -422,29 +447,6 @@ else
     if [ "$SKIPPED_COUNT" -lt 0 ]; then SKIPPED_COUNT=0; fi
 fi
 
-# Выводим обновленный отчет по вашим требованиям
-echo -e "${COLOR_SKIP} Количество пропущенных элементов плейлиста: $SKIPPED_COUNT${COLOR_RESET}"
-echo -e "--------------------------------------------------------------------------------"
-echo -e "${COLOR_DELETED} Количество удаленных и скрытых элементов плейлиста: $DELETED_COUNT${COLOR_RESET}"
-echo -e "--------------------------------------------------------------------------------"
-echo -e "${COLOR_RESTRICTED} Количество элементов плейлиста с ограниченным доступом: $RESTRICTED_COUNT${COLOR_RESET}"
-echo -e "--------------------------------------------------------------------------------"
-echo -e "${COLOR_DOWNLOADED} Всего элементов плейлиста скачано за текущий сеанс: $REAL_NEW_COUNT${COLOR_RESET}"
-echo -e "--------------------------------------------------------------------------------"
-
-if [ "$REAL_NEW_COUNT" -gt 0 ] && [ -s .downloaded_names.tmp ]; then
-    echo -e " Скачанные элементы плейлиста за текущий сеанс:"
-    cat -n .downloaded_names.tmp
-else
-    if [ "$REAL_NEW_COUNT" -gt 0 ]; then
-        echo -e "${COLOR_STATUS} [!] Успешно добавлено новых треков: $REAL_NEW_COUNT${COLOR_RESET}"
-    else
-        echo -e "${COLOR_STATUS} (Новых файлов добавлено не было, ваш плейлист полностью синхронизирован)${COLOR_RESET}"
-    fi
-fi
-
-echo -e "--------------------------------------------------------------------------------"
-
 # Добавляем список проблемных элементов с названием файла и ID
 PROBLEMATIC_LIST_FILE=".problematic_entries.tmp"
 : > "$PROBLEMATIC_LIST_FILE"
@@ -470,6 +472,35 @@ BEGIN { current_title = "" }
 }
 ' "$LOG_FILE" > "$PROBLEMATIC_LIST_FILE"
 
+cleanup_incomplete_webm
+
+DOWNLOAD_END_TIME=$(date +%s)
+ELAPSED_DOWNLOAD_TIME=$((DOWNLOAD_END_TIME - DOWNLOAD_START_TIME))
+ELAPSED_HOURS=$((ELAPSED_DOWNLOAD_TIME / 3600))
+ELAPSED_MINUTES=$(((ELAPSED_DOWNLOAD_TIME % 3600) / 60))
+ELAPSED_SECONDS=$((ELAPSED_DOWNLOAD_TIME % 60))
+printf -v FORMATTED_DOWNLOAD_TIME '%02d:%02d:%02d' \
+    "$ELAPSED_HOURS" "$ELAPSED_MINUTES" "$ELAPSED_SECONDS"
+
+echo -e "\n${COLOR_REPORT_FINAL}================================================================================${COLOR_RESET}"
+echo -e "${COLOR_REPORT_FINAL} ИТОГОВЫЙ ОТЧЕТ СИНХРОНИЗАЦИИ ПЛЕЙЛИСТА: $PLAYLIST_NAME${COLOR_RESET}"
+echo -e "${COLOR_REPORT_FINAL}================================================================================${COLOR_RESET}"
+echo -e "${COLOR_SKIP} Количество пропущенных элементов плейлиста: $SKIPPED_COUNT${COLOR_RESET}"
+echo -e "${COLOR_DELETED} Количество удаленных и скрытых элементов плейлиста: $DELETED_COUNT${COLOR_RESET}"
+echo -e "${COLOR_RESTRICTED} Количество элементов плейлиста с ограниченным доступом: $RESTRICTED_COUNT${COLOR_RESET}"
+echo -e "${COLOR_DOWNLOADED} Всего элементов плейлиста скачано за весь сеанс: $REAL_NEW_COUNT${COLOR_RESET}"
+echo -e "--------------------------------------------------------------------------------"
+echo -e " Времени затрачено: $FORMATTED_DOWNLOAD_TIME"
+
+if [ "$REAL_NEW_COUNT" -gt 0 ] && [ -s .downloaded_names.tmp ]; then
+    echo -e " Список скачанных элементов:"
+    cat -n .downloaded_names.tmp
+else
+    if [ "$REAL_NEW_COUNT" -eq 0 ]; then
+        echo -e "${COLOR_STATUS} (Новых файлов добавлено не было, ваш плейлист полностью синхронизирован)${COLOR_RESET}"
+    fi
+fi
+
 if [ -s "$PROBLEMATIC_LIST_FILE" ]; then
     echo -e " Проблемные элементы плейлиста:"
 
@@ -489,11 +520,6 @@ if [ -s "$PROBLEMATIC_LIST_FILE" ]; then
     echo -e "--------------------------------------------------------------------------------"
 fi
 
-# Удаляем временный скрытый файл
 rm -f .downloaded_names.tmp "$PROBLEMATIC_LIST_FILE"
 
-cleanup_incomplete_webm
-
-echo -e "================================================================================"
-echo -e "${COLOR_DOWNLOADED} Синхронизация плейлиста: $PLAYLIST_NAME полностью завершена.${COLOR_RESET}"
-echo -e "================================================================================\n"
+echo -e "${COLOR_REPORT_FINAL}================================================================================${COLOR_RESET}"
