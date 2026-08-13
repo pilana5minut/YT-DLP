@@ -24,6 +24,38 @@ fi
 # 2. НАСТРОЙКА КАТАЛОГОВ (Автоматическое разделение)
 BROWSER="chrome"
 
+get_playlist_name() {
+    local playlist_name
+
+    playlist_name=$(yt-dlp \
+        --flat-playlist \
+        --playlist-items 1 \
+        --print '%(playlist_title)s' \
+        --skip-download \
+        --cookies-from-browser "$BROWSER" \
+        --js-runtimes node \
+        --remote-components ejs:github \
+        --socket-timeout 60 \
+        "$PLAYLIST_URL" 2>/dev/null | sed -n '1p')
+
+    if [ -z "$playlist_name" ]; then
+        playlist_name=$(yt-dlp \
+            --flat-playlist \
+            --playlist-items 1 \
+            --print '%(playlist_title)s' \
+            --skip-download \
+            --js-runtimes node \
+            --remote-components ejs:github \
+            --socket-timeout 60 \
+            "$PLAYLIST_URL" 2>/dev/null | sed -n '1p')
+    fi
+
+    printf '%s\n' "$playlist_name"
+}
+
+PLAYLIST_NAME=$(get_playlist_name)
+PLAYLIST_NAME=${PLAYLIST_NAME:-Название плейлиста не определено}
+
 if [ -t 1 ]; then
     COLOR_RESET='\033[0m'
     COLOR_SKIP='\033[34m'      # Синий
@@ -31,6 +63,8 @@ if [ -t 1 ]; then
     COLOR_RESTRICTED='\033[33m' # Жёлтый
     COLOR_DOWNLOADED='\033[32m' # Зелёный
     COLOR_STATUS='\033[36m'    # Бирюзовый
+    COLOR_REPORT_INTERMEDIATE='\033[38;2;37;230;230m' # #25e6e6
+    COLOR_REPORT_FINAL='\033[38;2;196;59;196m'       # #c43bc4
 else
     COLOR_RESET=''
     COLOR_SKIP=''
@@ -38,6 +72,8 @@ else
     COLOR_RESTRICTED=''
     COLOR_DOWNLOADED=''
     COLOR_STATUS=''
+    COLOR_REPORT_INTERMEDIATE=''
+    COLOR_REPORT_FINAL=''
 fi
 
 # Имена новых целевых директорий
@@ -62,7 +98,7 @@ BEFORE_COUNT=$(wc -l < "$ARCHIVE_FILE")
 > "$LOG_FILE"
 
 echo -e "\n================================================================================"
-echo -e " Начинаем синхронизацию YouTube плейлиста"
+echo -e "${COLOR_SKIP} Начало синхронизации плейлиста: $PLAYLIST_NAME${COLOR_RESET}"
 echo -e " Рабочая директория: $PWD"
 echo -e " Элементы плейлиста сохраняются в: $MUSIC_DIR"
 echo -e " Логи и архив сохраняются в: $SERVICE_DIR"
@@ -72,7 +108,7 @@ print_intermediate_report() {
     local log_file="$1"
     local archive_file="$2"
     local before_count="$3"
-    local report_name="${4:-ПРОМЕЖУТОЧНЫЙ ОТЧЕТ СЕАНСА}"
+    local report_name="${4:-ПРОМЕЖУТОЧНЫЙ ОТЧЕТ СИНХРОНИЗАЦИИ ПЛЕЙЛИСТА: $PLAYLIST_NAME}"
     local progress_tmp=".progress_summary.tmp"
 
     grep ">>> \[ГОТОВО\]" "$log_file" 2>/dev/null | sed "s/.*>>> \[ГОТОВО\] //" | sed -e 's/[[:space:]]*$//' > "$progress_tmp"
@@ -100,7 +136,7 @@ print_intermediate_report() {
     fi
 
     echo -e "\n================================================================================"
-    echo -e " $report_name"
+    echo -e "${COLOR_REPORT_INTERMEDIATE} $report_name${COLOR_RESET}"
     echo -e "================================================================================"
     echo -e "${COLOR_SKIP} Количество пропущенных элементов плейлиста: $skipped_count${COLOR_RESET}"
     echo -e "--------------------------------------------------------------------------------"
@@ -125,7 +161,7 @@ monitor_download_progress() {
 
         if [ "$current_downloaded" -ge $((last_reported + 10)) ]; then
             last_reported=$((current_downloaded / 10 * 10))
-            print_intermediate_report "$LOG_FILE" "$ARCHIVE_FILE" "$BEFORE_COUNT" "ПРОМЕЖУТОЧНЫЙ ОТЧЕТ СЕАНСА"
+            print_intermediate_report "$LOG_FILE" "$ARCHIVE_FILE" "$BEFORE_COUNT" "ПРОМЕЖУТОЧНЫЙ ОТЧЕТ СИНХРОНИЗАЦИИ ПЛЕЙЛИСТА: $PLAYLIST_NAME"
         fi
 
         sleep 2
@@ -137,7 +173,7 @@ monitor_download_progress() {
     final_downloaded=${final_downloaded:-0}
 
     if [ "$final_downloaded" -gt "$last_reported" ] && [ $((final_downloaded % 10)) -ne 0 ]; then
-        print_intermediate_report "$LOG_FILE" "$ARCHIVE_FILE" "$BEFORE_COUNT" "ПРОМЕЖУТОЧНЫЙ ОТЧЕТ СЕАНСА"
+        print_intermediate_report "$LOG_FILE" "$ARCHIVE_FILE" "$BEFORE_COUNT" "ПРОМЕЖУТОЧНЫЙ ОТЧЕТ СИНХРОНИЗАЦИИ ПЛЕЙЛИСТА: $PLAYLIST_NAME"
     fi
 }
 
@@ -145,7 +181,7 @@ cleanup_and_exit() {
     local signal_name="${1:-INT}"
 
     echo -e "\n================================================================================"
-    echo -e " Прерывание работы по Ctrl+C. Синхронизация остановлена."
+    echo -e "${COLOR_DELETED} Прерывание работы по Ctrl+C. Синхронизация плейлиста: $PLAYLIST_NAME была остановлена.${COLOR_RESET}"
     echo -e "================================================================================\n"
 
     if [ -n "${YT_PID:-}" ] && kill -0 "$YT_PID" 2>/dev/null; then
@@ -171,10 +207,10 @@ trap 'cleanup_and_exit TERM' TERM
 # считает готовые треки, печатает промежуточный отчёт каждые 10 и
 # корректно обрабатывает Ctrl+C без докачивания полного плейлиста.
 
-python3 - "$PLAYLIST_URL" "$LOG_FILE" "$ARCHIVE_FILE" "$BEFORE_COUNT" "$MUSIC_DIR" "$BROWSER" <<'PY'
+python3 - "$PLAYLIST_URL" "$LOG_FILE" "$ARCHIVE_FILE" "$BEFORE_COUNT" "$MUSIC_DIR" "$BROWSER" "$PLAYLIST_NAME" <<'PY'
 import os, sys, subprocess, signal, re
 
-playlist_url, log_file, archive_file, before_count_str, music_dir, browser = sys.argv[1:7]
+playlist_url, log_file, archive_file, before_count_str, music_dir, browser, playlist_name = sys.argv[1:8]
 before_count = int(before_count_str)
 
 
@@ -220,7 +256,9 @@ def report_stats(log_path, archive_path, before_total):
         skipped_count = before_total
 
     print('\n' + '=' * 80)
-    print(' ПРОМЕЖУТОЧНЫЙ ОТЧЕТ СЕАНСА')
+    report_color = '\033[38;2;37;230;230m' if sys.stdout.isatty() else ''
+    reset_color = '\033[0m' if sys.stdout.isatty() else ''
+    print(f'{report_color} ПРОМЕЖУТОЧНЫЙ ОТЧЕТ СИНХРОНИЗАЦИИ ПЛЕЙЛИСТА: {playlist_name}{reset_color}')
     print('=' * 80)
     print(f' Количество пропущенных элементов плейлиста: {skipped_count}')
     print('-' * 80)
@@ -315,14 +353,14 @@ YT_EXIT=$?
 
 if [ "$YT_EXIT" -eq 130 ]; then
     echo -e "\n================================================================================"
-    echo -e " Прерывание работы по Ctrl+C. Синхронизация остановлена."
+    echo -e "${COLOR_DELETED} Прерывание работы по Ctrl+C. Синхронизация плейлиста: $PLAYLIST_NAME была остановлена.${COLOR_RESET}"
     echo -e "================================================================================\n"
     exit 130
 fi
 
 # 4. АНАЛИЗ И МАТЕМАТИЧЕСКИЙ РАСЧЕТ ОТЧЕТА
 echo -e "\n================================================================================"
-echo -e " ФОРМИРОВАНИЕ ИТОГОВОГО ОТЧЕТА СЕАНСА"
+echo -e "${COLOR_REPORT_FINAL} ИТОГОВЫЙ ОТЧЕТ СИНХРОНИЗАЦИИ ПЛЕЙЛИСТА: $PLAYLIST_NAME${COLOR_RESET}"
 echo -e "================================================================================"
 
 # Извлекаем чистые названия скачанных треков из лога
@@ -428,5 +466,5 @@ fi
 rm -f .downloaded_names.tmp "$PROBLEMATIC_LIST_FILE"
 
 echo -e "================================================================================"
-echo -e " Синхронизация полностью завершена!"
+echo -e "${COLOR_DOWNLOADED} Синхронизация плейлиста: $PLAYLIST_NAME полностью завершена.${COLOR_RESET}"
 echo -e "================================================================================\n"
