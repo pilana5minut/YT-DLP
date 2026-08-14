@@ -197,8 +197,8 @@ with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
         if not m_err:
             continue
 
-        vid = m_err.group(1)
-        msg = m_err.group(2)
+        vid = m_err.group(1).strip()
+        msg = m_err.group(2).strip()
         if restricted_re.search(msg):
             category = 'restricted'
         elif deleted_re.search(msg):
@@ -290,17 +290,11 @@ cleanup_incomplete_webm() {
     done < <(find "$MUSIC_DIR" -maxdepth 1 -type f -print0 2>/dev/null)
 
     if [ "$removed_count" -gt 0 ]; then
-        echo -e "${COLOR_DELETED} Удалено файлов от незавершенных/повреждённых загрузок: $removed_count${COLOR_RESET}"
+        REMOVED_INCOMPLETE_COUNT=$removed_count
     fi
 }
 
 cleanup_and_exit() {
-    local signal_name="${1:-INT}"
-
-    echo -e "\n================================================================================"
-    echo -e "${COLOR_DELETED} Прерывание работы по Ctrl+C. Синхронизация плейлиста: $PLAYLIST_NAME была остановлена.${COLOR_RESET}"
-    echo -e "================================================================================\n"
-
     if [ -n "${YT_PID:-}" ] && kill -0 "$YT_PID" 2>/dev/null; then
         kill -INT "$YT_PID" 2>/dev/null || kill -TERM "$YT_PID" 2>/dev/null || true
     fi
@@ -314,10 +308,11 @@ cleanup_and_exit() {
     fi
 
     cleanup_incomplete_webm
-
-    exit 130
+    INTERRUPTED=1
 }
 
+INTERRUPTED=0
+REMOVED_INCOMPLETE_COUNT=0
 trap 'cleanup_and_exit INT' INT
 trap 'cleanup_and_exit TERM' TERM
 
@@ -364,23 +359,34 @@ def report_stats(log_path, archive_path, before_total, sync_start_time, forced_n
     if forced_new_count is not None and forced_new_count > real_new_count:
         real_new_count = forced_new_count
 
-    deleted_count = 0
-    restricted_count = 0
+    error_by_id = {}
     hidden_unavailable_count = 0
     if os.path.exists(log_path):
         with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
             for line in f:
                 clean_line = ansi_re.sub('', line)
                 if 'ERROR: [youtube]' in clean_line:
-                    if re.search(r'(Video unavailable|no longer available because|This video is no longer available)', clean_line):
-                        deleted_count += 1
-                    if re.search(r'(not made this video available in your country|This video is not available in your country|blocked due to the claimed content|Private video|Sign in if you\'ve been granted access|This video is not available)', clean_line):
-                        restricted_count += 1
+                    match = re.match(r'^ERROR: \[youtube\] ([^:]+):\s*(.*)$', clean_line)
+                    if match:
+                        video_id = match.group(1).strip()
+                        message = match.group(2).strip()
+                        if re.search(r'(not made this video available in your country|This video is not available in your country|blocked due to the claimed content|Private video|Sign in if you\'ve been granted access|This video is not available)', message):
+                            category = 'restricted'
+                        elif re.search(r'(Video unavailable|no longer available because|This video is no longer available)', message):
+                            category = 'deleted'
+                        else:
+                            category = 'restricted'
+
+                        previous_category = error_by_id.get(video_id)
+                        if previous_category is None or (previous_category == 'deleted' and category == 'restricted'):
+                            error_by_id[video_id] = category
                 m_hidden = re.search(r'INFO\s+-\s+(\d+)\s+unavailable videos are hidden', clean_line)
                 if m_hidden:
                     hidden_unavailable_count += int(m_hidden.group(1))
 
-    restricted_count += hidden_unavailable_count
+    restricted_count = sum(1 for category in error_by_id.values() if category == 'restricted')
+    deleted_count = sum(1 for category in error_by_id.values() if category == 'deleted')
+    restricted_count += max(hidden_unavailable_count - len(error_by_id), 0)
 
     total_items = 0
     if os.path.exists(log_path):
@@ -441,6 +447,7 @@ cmd = [
     '--progress',
     '--print', 'before_dl:>>> [СКАЧИВАНИЕ] %(title)s',
     '--print', 'after_move:>>> [ГОТОВО] %(title)s',
+    '--print', 'after_move:' + '-' * 80,
     playlist_url,
 ]
 
@@ -526,11 +533,9 @@ PY
 YT_EXIT=$?
 
 if [ "$YT_EXIT" -eq 130 ]; then
-    echo -e "\n================================================================================"
-    echo -e "${COLOR_DELETED} Прерывание работы по Ctrl+C. Синхронизация плейлиста: $PLAYLIST_NAME была остановлена.${COLOR_RESET}"
-    echo -e "================================================================================\n"
-    cleanup_incomplete_webm
-    exit 130
+    if [ "$INTERRUPTED" -eq 0 ]; then
+        cleanup_incomplete_webm
+    fi
 fi
 
 # 4. АНАЛИЗ И МАТЕМАТИЧЕСКИЙ РАСЧЕТ ОТЧЕТА
@@ -541,13 +546,14 @@ NOT_DOWNLOADED_FILE=".not_downloaded_items.tmp"
 
 sed -E 's/\x1B\[[0-9;]*[[:alpha:]]//g' "$LOG_FILE" > "$CLEAN_LOG_FILE"
 
-python3 - "$CLEAN_LOG_FILE" "$ARCHIVE_FILE" "$BEFORE_COUNT" "$PLAYLIST_INDEX_FILE" "$ANALYSIS_FILE" "$DOWNLOADED_NAMES_FILE" "$NOT_DOWNLOADED_FILE" "$BEFORE_ARCHIVE_FILE" <<'PY'
+python3 - "$CLEAN_LOG_FILE" "$ARCHIVE_FILE" "$BEFORE_COUNT" "$PLAYLIST_INDEX_FILE" "$ANALYSIS_FILE" "$DOWNLOADED_NAMES_FILE" "$NOT_DOWNLOADED_FILE" "$BEFORE_ARCHIVE_FILE" "$INTERRUPTED" <<'PY'
 import re
 import sys
 from pathlib import Path
 
-clean_log_file, archive_file, before_count_str, playlist_index_file, analysis_file, downloaded_file, not_downloaded_file, before_archive_file = sys.argv[1:9]
+clean_log_file, archive_file, before_count_str, playlist_index_file, analysis_file, downloaded_file, not_downloaded_file, before_archive_file, interrupted_str = sys.argv[1:10]
 before_count = int(before_count_str)
+interrupted = interrupted_str == '1'
 
 restricted_re = re.compile(r'(not made this video available in your country|This video is not available in your country|blocked due to the claimed content|Private video|Sign in if you\'ve been granted access|This video is not available)')
 deleted_re = re.compile(r'(Video unavailable|no longer available because|This video is no longer available)')
@@ -641,7 +647,7 @@ hidden_extra = max(hidden_unavailable - len(error_by_id), 0)
 restricted_count = len(restricted_ids) + hidden_extra
 deleted_count = len(deleted_ids)
 
-if total_items > 0:
+if total_items > 0 and not interrupted:
     residual_skipped = max(total_items - real_new_count - deleted_count - restricted_count, 0)
 else:
     residual_skipped = 0
@@ -679,9 +685,17 @@ ELAPSED_SECONDS=$((ELAPSED_DOWNLOAD_TIME % 60))
 printf -v FORMATTED_DOWNLOAD_TIME '%02d:%02d:%02d' \
     "$ELAPSED_HOURS" "$ELAPSED_MINUTES" "$ELAPSED_SECONDS"
 
-echo -e "\n${COLOR_REPORT_FINAL}================================================================================${COLOR_RESET}"
-echo -e "${COLOR_REPORT_FINAL}ИТОГОВЫЙ ОТЧЕТ СИНХРОНИЗАЦИИ ПЛЕЙЛИСТА: $PLAYLIST_NAME${COLOR_RESET}"
-echo -e "${COLOR_REPORT_FINAL}================================================================================${COLOR_RESET}"
+if [ "$INTERRUPTED" -eq 1 ]; then
+    echo -e "\n${COLOR_DELETED}================================================================================${COLOR_RESET}"
+    echo -e "${COLOR_DELETED}ПРЕРЫВАНИЕ РАБОТЫ ПО КОМАНДЕ Ctrl+C${COLOR_RESET}"
+    echo -e "${COLOR_DELETED}СИНХРОНИЗАЦИЯ ПЛЕЙЛИСТА: $PLAYLIST_NAME БЫЛА ОСТАНОВЛЕНА${COLOR_RESET}"
+    echo -e "${COLOR_DELETED}Удалено файлов от незавершенных/повреждённых загрузок: $REMOVED_INCOMPLETE_COUNT${COLOR_RESET}"
+    echo -e "${COLOR_DELETED}================================================================================${COLOR_RESET}"
+else
+    echo -e "\n${COLOR_REPORT_FINAL}================================================================================${COLOR_RESET}"
+    echo -e "${COLOR_REPORT_FINAL}ИТОГОВЫЙ ОТЧЕТ СИНХРОНИЗАЦИИ ПЛЕЙЛИСТА: $PLAYLIST_NAME${COLOR_RESET}"
+    echo -e "${COLOR_REPORT_FINAL}================================================================================${COLOR_RESET}"
+fi
 echo -e "${COLOR_SKIP}Количество пропущенных элементов плейлиста: $SKIPPED_COUNT${COLOR_RESET}"
 echo -e "Количество удаленных и скрытых элементов плейлиста: $DELETED_COUNT"
 echo -e "Количество элементов плейлиста с ограниченным доступом: $RESTRICTED_COUNT"
@@ -710,4 +724,8 @@ fi
 
 rm -f "$ANALYSIS_FILE" "$DOWNLOADED_NAMES_FILE" "$NOT_DOWNLOADED_FILE" "$CLEAN_LOG_FILE" "$BEFORE_ARCHIVE_FILE"
 
-echo -e "${COLOR_REPORT_FINAL}================================================================================${COLOR_RESET}"
+if [ "$INTERRUPTED" -eq 1 ]; then
+    echo -e "${COLOR_DELETED}================================================================================${COLOR_RESET}"
+else
+    echo -e "${COLOR_REPORT_FINAL}================================================================================${COLOR_RESET}"
+fi
