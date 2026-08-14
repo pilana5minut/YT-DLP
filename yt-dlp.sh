@@ -51,6 +51,43 @@ get_playlist_name() {
 PLAYLIST_NAME=$(get_playlist_name)
 PLAYLIST_NAME=${PLAYLIST_NAME:-Название плейлиста не определено}
 
+build_playlist_index() {
+    local output_file="$1"
+    local tmp_file="${output_file}.tmp"
+
+    : > "$output_file"
+
+    yt-dlp \
+        --flat-playlist \
+        --skip-download \
+        --ignore-errors \
+        --print '%(id)s\t%(title)s' \
+        --cookies-from-browser "$BROWSER" \
+        --js-runtimes node \
+        --remote-components ejs:github \
+        --socket-timeout 60 \
+        "$PLAYLIST_URL" 2>/dev/null > "$output_file" || true
+
+    if [ ! -s "$output_file" ]; then
+        yt-dlp \
+            --flat-playlist \
+            --skip-download \
+            --ignore-errors \
+            --print '%(id)s\t%(title)s' \
+            --js-runtimes node \
+            --remote-components ejs:github \
+            --socket-timeout 60 \
+            "$PLAYLIST_URL" 2>/dev/null > "$output_file" || true
+    fi
+
+    awk -F'\t' 'NF >= 2 && !seen[$1]++ { print $1 "\t" $2 }' "$output_file" > "$tmp_file" 2>/dev/null || true
+    if [ -s "$tmp_file" ]; then
+        mv "$tmp_file" "$output_file"
+    else
+        rm -f "$tmp_file"
+    fi
+}
+
 if [ -t 1 ]; then
     COLOR_RESET='\033[0m'
     COLOR_SKIP='\033[34m'      # Синий
@@ -82,12 +119,18 @@ mkdir -p "$SERVICE_DIR"
 # Переносим пути служебных файлов в отдельную папку
 LOG_FILE="$SERVICE_DIR/sync_log.txt"
 ARCHIVE_FILE="$SERVICE_DIR/downloaded_songs.txt"
+PLAYLIST_INDEX_FILE="$SERVICE_DIR/playlist_index.tsv"
+BEFORE_ARCHIVE_FILE="$SERVICE_DIR/.archive_before_sync.tmp"
+
+# Сохраняем индекс ID->название для красивых отчетов
+build_playlist_index "$PLAYLIST_INDEX_FILE"
 
 # Создаем файл архива внутри новой папки, если его нет
 touch "$ARCHIVE_FILE"
 
 # Фиксируем, сколько треков было скачано ДО этого сеанса
 BEFORE_COUNT=$(wc -l < "$ARCHIVE_FILE")
+cp -f "$ARCHIVE_FILE" "$BEFORE_ARCHIVE_FILE" 2>/dev/null || : > "$BEFORE_ARCHIVE_FILE"
 
 # Очищаем технический лог перед началом работы
 > "$LOG_FILE"
@@ -117,18 +160,70 @@ print_intermediate_report() {
         local real_new_count=$downloaded_count
     fi
 
-    local deleted_count=$(grep -E 'ERROR: \[youtube\].*(Video unavailable|not made this video available in your country|blocked due to the claimed content|no longer available because|This video is not available|This video is no longer available|This video is not available in your country)' "$log_file" 2>/dev/null | wc -l | tr -d ' ')
-    local restricted_count=$(grep -E "ERROR: \[youtube\].*(Private video|Sign in if you've been granted access)" "$log_file" 2>/dev/null | wc -l | tr -d ' ')
-    local total_items=$(grep -oE "Downloading [0-9]+ items" "$log_file" | tail -n 1 | awk '{print $2}')
+    local clean_log_file=".intermediate_sync_log_clean.tmp"
+    sed -E 's/\x1B\[[0-9;]*[[:alpha:]]//g' "$log_file" > "$clean_log_file"
 
-    local skipped_count=0
-    if [ -z "$total_items" ]; then
-        total_items=$((before_count + real_new_count + deleted_count + restricted_count))
-        skipped_count=$before_count
-    else
-        skipped_count=$((total_items - real_new_count - deleted_count - restricted_count))
-        if [ "$skipped_count" -lt 0 ]; then skipped_count=0; fi
-    fi
+    local stats
+    stats=$(python3 - "$clean_log_file" "$real_new_count" <<'PY'
+import re
+import sys
+
+log_path, real_new_count_str = sys.argv[1:3]
+real_new_count = int(real_new_count_str)
+
+restricted_re = re.compile(r'(not made this video available in your country|This video is not available in your country|blocked due to the claimed content|Private video|Sign in if you\'ve been granted access|This video is not available)')
+deleted_re = re.compile(r'(Video unavailable|no longer available because|This video is no longer available)')
+
+error_by_id = {}
+hidden_unavailable = 0
+skipped_archive = 0
+total_items = 0
+
+with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+    for raw in f:
+        line = raw.strip()
+        m_total = re.search(r'Downloading\s+(\d+)\s+items', line)
+        if m_total:
+            total_items = int(m_total.group(1))
+
+        m_hidden = re.search(r'INFO\s+-\s+(\d+)\s+unavailable videos are hidden', line)
+        if m_hidden:
+            hidden_unavailable += int(m_hidden.group(1))
+
+        if 'has already been recorded in the archive' in line:
+            skipped_archive += 1
+
+        m_err = re.match(r'^ERROR: \[youtube\] ([^:]+):\s*(.*)$', line)
+        if not m_err:
+            continue
+
+        vid = m_err.group(1)
+        msg = m_err.group(2)
+        if restricted_re.search(msg):
+            category = 'restricted'
+        elif deleted_re.search(msg):
+            category = 'deleted'
+        else:
+            category = 'restricted'
+
+        prev = error_by_id.get(vid)
+        if prev is None or (prev == 'deleted' and category == 'restricted'):
+            error_by_id[vid] = category
+
+restricted_ids = sum(1 for c in error_by_id.values() if c == 'restricted')
+deleted_ids = sum(1 for c in error_by_id.values() if c == 'deleted')
+hidden_extra = max(hidden_unavailable - len(error_by_id), 0)
+restricted_count = restricted_ids + hidden_extra
+deleted_count = deleted_ids
+
+skipped_count = skipped_archive
+
+print(f'{skipped_count}|{deleted_count}|{restricted_count}')
+PY
+)
+
+local skipped_count deleted_count restricted_count
+IFS='|' read -r skipped_count deleted_count restricted_count <<< "$stats"
 
     echo -e "\n================================================================================"
     echo -e "${COLOR_REPORT_INTERMEDIATE} $report_name${COLOR_RESET}"
@@ -142,7 +237,7 @@ print_intermediate_report() {
     echo -e "${COLOR_DOWNLOADED} Всего элементов плейлиста скачано за текущий сеанс: $real_new_count${COLOR_RESET}"
     echo -e "--------------------------------------------------------------------------------"
 
-    rm -f "$progress_tmp"
+    rm -f "$progress_tmp" "$clean_log_file"
 }
 
 monitor_download_progress() {
@@ -240,6 +335,7 @@ from yt_dlp import YoutubeDL, parse_options
 playlist_url, log_file, archive_file, before_count_str, music_dir, browser, playlist_name, start_time_str = sys.argv[1:9]
 before_count = int(before_count_str)
 start_time = int(start_time_str)
+ansi_re = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
 
 
 def format_duration(total_seconds):
@@ -248,13 +344,14 @@ def format_duration(total_seconds):
     return f'{hours:02d}:{minutes:02d}:{seconds:02d}'
 
 
-def report_stats(log_path, archive_path, before_total, sync_start_time):
+def report_stats(log_path, archive_path, before_total, sync_start_time, forced_new_count=None):
     names = []
     if os.path.exists(log_path):
         with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
             for line in f:
-                if '>>> [ГОТОВО]' in line:
-                    names.append(line.split('>>> [ГОТОВО] ', 1)[1].strip())
+                clean_line = ansi_re.sub('', line)
+                if '>>> [ГОТОВО]' in clean_line:
+                    names.append(clean_line.split('>>> [ГОТОВО] ', 1)[1].strip())
 
     downloaded_count = len(names)
     if os.path.exists(archive_path):
@@ -264,30 +361,43 @@ def report_stats(log_path, archive_path, before_total, sync_start_time):
         after_count = 0
 
     real_new_count = max(after_count - before_total, downloaded_count)
+    if forced_new_count is not None and forced_new_count > real_new_count:
+        real_new_count = forced_new_count
 
     deleted_count = 0
     restricted_count = 0
+    hidden_unavailable_count = 0
     if os.path.exists(log_path):
         with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
             for line in f:
-                if 'ERROR: [youtube]' in line:
-                    if re.search(r'(Video unavailable|not made this video available in your country|blocked due to the claimed content|no longer available because|This video is not available|This video is no longer available|This video is not available in your country)', line):
+                clean_line = ansi_re.sub('', line)
+                if 'ERROR: [youtube]' in clean_line:
+                    if re.search(r'(Video unavailable|no longer available because|This video is no longer available)', clean_line):
                         deleted_count += 1
-                    if re.search(r'(Private video|Sign in if you\'ve been granted access)', line):
+                    if re.search(r'(not made this video available in your country|This video is not available in your country|blocked due to the claimed content|Private video|Sign in if you\'ve been granted access|This video is not available)', clean_line):
                         restricted_count += 1
+                m_hidden = re.search(r'INFO\s+-\s+(\d+)\s+unavailable videos are hidden', clean_line)
+                if m_hidden:
+                    hidden_unavailable_count += int(m_hidden.group(1))
+
+    restricted_count += hidden_unavailable_count
 
     total_items = 0
     if os.path.exists(log_path):
         with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
             for line in f:
-                m = re.search(r'Downloading\s+(\d+)\s+items', line)
+                clean_line = ansi_re.sub('', line)
+                m = re.search(r'Downloading\s+(\d+)\s+items', clean_line)
                 if m:
                     total_items = int(m.group(1))
 
-    if total_items:
-        skipped_count = max(total_items - real_new_count - deleted_count - restricted_count, 0)
-    else:
-        skipped_count = before_total
+    skipped_count = 0
+    if os.path.exists(log_path):
+        with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                clean_line = ansi_re.sub('', line)
+                if 'has already been recorded in the archive' in clean_line:
+                    skipped_count += 1
 
     report_color = '\033[38;2;37;230;230m' if sys.stdout.isatty() else ''
     reset_color = '\033[0m' if sys.stdout.isatty() else ''
@@ -306,6 +416,7 @@ def report_stats(log_path, archive_path, before_total, sync_start_time):
 
 cmd = [
     'yt-dlp',
+    '--no-colors',
     '--extract-audio',
     '--audio-format', 'mp3',
     '--audio-quality', '0',
@@ -345,7 +456,13 @@ def progress_hook(status):
     if state['finished_count'] >= state['last_reported'] + 10:
         state['last_reported'] = (state['finished_count'] // 10) * 10
         log_handle.flush()
-        report_stats(log_file, archive_file, before_count, start_time)
+        report_stats(
+            log_file,
+            archive_file,
+            before_count,
+            start_time,
+            forced_new_count=state['finished_count'],
+        )
 
 
 ydl_params['progress_hooks'] = [progress_hook]
@@ -364,8 +481,10 @@ class OutputLogger:
 
     def _write(self, message):
         text = str(message)
+        clean_text = ansi_re.sub('', text)
         log_handle.write(text + '\n')
         log_handle.flush()
+
         if any(pattern.search(text) for pattern in self.terminal_patterns):
             sys.stdout.write(text + '\n')
             sys.stdout.flush()
@@ -415,62 +534,140 @@ if [ "$YT_EXIT" -eq 130 ]; then
 fi
 
 # 4. АНАЛИЗ И МАТЕМАТИЧЕСКИЙ РАСЧЕТ ОТЧЕТА
-# Извлекаем чистые названия скачанных треков из лога
-grep ">>> \[ГОТОВО\]" "$LOG_FILE" | sed "s/.*>>> \[ГОТОВО\] //" | sed -e 's/[[:space:]]*$//' > .downloaded_names.tmp
+CLEAN_LOG_FILE=".sync_log_clean.tmp"
+ANALYSIS_FILE=".analysis_vars.tmp"
+DOWNLOADED_NAMES_FILE=".downloaded_names.tmp"
+NOT_DOWNLOADED_FILE=".not_downloaded_items.tmp"
 
-DOWNLOADED_COUNT=$(wc -l < .downloaded_names.tmp)
+sed -E 's/\x1B\[[0-9;]*[[:alpha:]]//g' "$LOG_FILE" > "$CLEAN_LOG_FILE"
 
-# Сверяемся по изменению физического файла архива
-AFTER_COUNT=$(wc -l < "$ARCHIVE_FILE")
-NEW_ARCHIVE_COUNT=$((AFTER_COUNT - BEFORE_COUNT))
+python3 - "$CLEAN_LOG_FILE" "$ARCHIVE_FILE" "$BEFORE_COUNT" "$PLAYLIST_INDEX_FILE" "$ANALYSIS_FILE" "$DOWNLOADED_NAMES_FILE" "$NOT_DOWNLOADED_FILE" "$BEFORE_ARCHIVE_FILE" <<'PY'
+import re
+import sys
+from pathlib import Path
 
-if [ "$NEW_ARCHIVE_COUNT" -gt "$DOWNLOADED_COUNT" ]; then
-    REAL_NEW_COUNT=$NEW_ARCHIVE_COUNT
-else
-    REAL_NEW_COUNT=$DOWNLOADED_COUNT
-fi
+clean_log_file, archive_file, before_count_str, playlist_index_file, analysis_file, downloaded_file, not_downloaded_file, before_archive_file = sys.argv[1:9]
+before_count = int(before_count_str)
 
-# Подсчет проблемных видео по типам ошибок YouTube.
-# Важно: итоговое количество элементов плейлиста должно сходиться ровно:
-# TOTAL_ITEMS = DOWNLOADED + DELETED + RESTRICTED + SKIPPED
-DELETED_COUNT=$(grep -E 'ERROR: \[youtube\].*(Video unavailable|not made this video available in your country|blocked due to the claimed content|no longer available because|This video is not available|This video is no longer available|This video is not available in your country)' "$LOG_FILE" 2>/dev/null | wc -l | tr -d ' ')
-RESTRICTED_COUNT=$(grep -E "ERROR: \[youtube\].*(Private video|Sign in if you've been granted access)" "$LOG_FILE" 2>/dev/null | wc -l | tr -d ' ')
+restricted_re = re.compile(r'(not made this video available in your country|This video is not available in your country|blocked due to the claimed content|Private video|Sign in if you\'ve been granted access|This video is not available)')
+deleted_re = re.compile(r'(Video unavailable|no longer available because|This video is no longer available)')
 
-# Получаем общее количество видео в плейлисте
-TOTAL_ITEMS=$(grep -oE "Downloading [0-9]+ items" "$LOG_FILE" | head -n 1 | awk '{print $2}')
+playlist_title_by_id = {}
+index_path = Path(playlist_index_file)
+if index_path.exists():
+    for raw in index_path.read_text(encoding='utf-8', errors='replace').splitlines():
+        if '\t' not in raw:
+            continue
+        vid, title = raw.split('\t', 1)
+        vid = vid.strip()
+        title = title.strip()
+        if vid and title and vid not in playlist_title_by_id:
+            playlist_title_by_id[vid] = title
 
-if [ -z "$TOTAL_ITEMS" ]; then
-    TOTAL_ITEMS=$((BEFORE_COUNT + REAL_NEW_COUNT + DELETED_COUNT + RESTRICTED_COUNT))
-    SKIPPED_COUNT=$BEFORE_COUNT
-else
-    SKIPPED_COUNT=$((TOTAL_ITEMS - REAL_NEW_COUNT - DELETED_COUNT - RESTRICTED_COUNT))
-    if [ "$SKIPPED_COUNT" -lt 0 ]; then SKIPPED_COUNT=0; fi
-fi
+downloaded_title_by_id = {}
+error_by_id = {}
+hidden_unavailable = 0
+total_items = 0
+skipped_archive = 0
 
-# Добавляем список проблемных элементов с названием файла и ID
-PROBLEMATIC_LIST_FILE=".problematic_entries.tmp"
-: > "$PROBLEMATIC_LIST_FILE"
+for raw in Path(clean_log_file).read_text(encoding='utf-8', errors='replace').splitlines():
+    line = raw.strip()
 
-awk '
-BEGIN { current_title = "" }
-{
-    if ($0 ~ />>> \[СКАЧИВАНИЕ\]/) {
-        current_title = substr($0, index($0, ">>> [СКАЧИВАНИЕ] ") + length(">>> [СКАЧИВАНИЕ] "))
-        next
-    }
+    m_total = re.search(r'Downloading\s+(\d+)\s+items', line)
+    if m_total:
+        total_items = int(m_total.group(1))
 
-    if ($0 ~ /^ERROR: \[youtube\]/) {
-        if (match($0, /^ERROR: \[youtube\] ([^:]+):/, m)) {
-            id = m[1]
-            if (current_title == "") {
-                current_title = "Неизвестно"
-            }
-            print current_title "\t" id "\t" $0
-            current_title = ""
-        }
-    }
-}
-' "$LOG_FILE" > "$PROBLEMATIC_LIST_FILE"
+    m_hidden = re.search(r'INFO\s+-\s+(\d+)\s+unavailable videos are hidden', line)
+    if m_hidden:
+        hidden_unavailable += int(m_hidden.group(1))
+
+    if 'has already been recorded in the archive' in line:
+        skipped_archive += 1
+
+    m_dest = re.match(r'^\[ExtractAudio\] Destination:\s+.+/(.+?) \[([A-Za-z0-9_-]{11})\]\.mp3$', line)
+    if m_dest:
+        downloaded_title_by_id[m_dest.group(2)] = m_dest.group(1)
+
+    m_err = re.match(r'^ERROR: \[youtube\] ([^:]+):\s*(.*)$', line)
+    if not m_err:
+        continue
+
+    vid = m_err.group(1).strip()
+    msg = m_err.group(2).strip()
+
+    if restricted_re.search(msg):
+        category = 'restricted'
+    elif deleted_re.search(msg):
+        category = 'deleted'
+    else:
+        category = 'restricted'
+
+    prev = error_by_id.get(vid)
+    if prev is None:
+        error_by_id[vid] = (category, msg)
+    elif prev[0] == 'deleted' and category == 'restricted':
+        error_by_id[vid] = (category, msg)
+
+after_count = 0
+archive_path = Path(archive_file)
+if archive_path.exists():
+    after_count = sum(1 for line in archive_path.read_text(encoding='utf-8', errors='replace').splitlines() if line.strip())
+
+def extract_ids(path):
+    ids = []
+    if not path.exists():
+        return ids
+    for row in path.read_text(encoding='utf-8', errors='replace').splitlines():
+        row = row.strip()
+        if not row:
+            continue
+        m = re.search(r'([A-Za-z0-9_-]{11})\s*$', row)
+        if m:
+            ids.append(m.group(1))
+    return ids
+
+before_ids = set(extract_ids(Path(before_archive_file)))
+after_ids_ordered = extract_ids(Path(archive_file))
+new_ids = [vid for vid in after_ids_ordered if vid not in before_ids]
+
+downloaded_names = [playlist_title_by_id.get(vid, f'Видео с ID {vid}') for vid in new_ids]
+downloaded_names = [f'{vid}\t{downloaded_title_by_id.get(vid, playlist_title_by_id.get(vid, f"Видео с ID {vid}"))}' for vid in new_ids]
+real_new_count = len(new_ids)
+
+restricted_ids = [vid for vid, (category, _) in error_by_id.items() if category == 'restricted']
+deleted_ids = [vid for vid, (category, _) in error_by_id.items() if category == 'deleted']
+
+hidden_extra = max(hidden_unavailable - len(error_by_id), 0)
+restricted_count = len(restricted_ids) + hidden_extra
+deleted_count = len(deleted_ids)
+
+if total_items > 0:
+    residual_skipped = max(total_items - real_new_count - deleted_count - restricted_count, 0)
+else:
+    residual_skipped = 0
+skipped_count = max(skipped_archive, residual_skipped)
+
+Path(downloaded_file).write_text('\n'.join(downloaded_names) + ('\n' if downloaded_names else ''), encoding='utf-8')
+
+lines = []
+for vid, (category, reason) in sorted(error_by_id.items(), key=lambda x: x[0]):
+    lines.append(f'{vid}\t{reason}')
+
+for idx in range(hidden_extra):
+    lines.append(f'-\tYouTube: unavailable videos are hidden (скрытый недоступный элемент #{idx + 1})')
+
+Path(not_downloaded_file).write_text('\n'.join(lines) + ('\n' if lines else ''), encoding='utf-8')
+
+Path(analysis_file).write_text(
+    f'REAL_NEW_COUNT={real_new_count}\n'
+    f'DELETED_COUNT={deleted_count}\n'
+    f'RESTRICTED_COUNT={restricted_count}\n'
+    f'SKIPPED_COUNT={skipped_count}\n',
+    encoding='utf-8'
+)
+PY
+
+source "$ANALYSIS_FILE"
 
 cleanup_incomplete_webm
 
@@ -483,43 +680,34 @@ printf -v FORMATTED_DOWNLOAD_TIME '%02d:%02d:%02d' \
     "$ELAPSED_HOURS" "$ELAPSED_MINUTES" "$ELAPSED_SECONDS"
 
 echo -e "\n${COLOR_REPORT_FINAL}================================================================================${COLOR_RESET}"
-echo -e "${COLOR_REPORT_FINAL} ИТОГОВЫЙ ОТЧЕТ СИНХРОНИЗАЦИИ ПЛЕЙЛИСТА: $PLAYLIST_NAME${COLOR_RESET}"
+echo -e "${COLOR_REPORT_FINAL}ИТОГОВЫЙ ОТЧЕТ СИНХРОНИЗАЦИИ ПЛЕЙЛИСТА: $PLAYLIST_NAME${COLOR_RESET}"
 echo -e "${COLOR_REPORT_FINAL}================================================================================${COLOR_RESET}"
-echo -e "${COLOR_SKIP} Количество пропущенных элементов плейлиста: $SKIPPED_COUNT${COLOR_RESET}"
-echo -e "${COLOR_DELETED} Количество удаленных и скрытых элементов плейлиста: $DELETED_COUNT${COLOR_RESET}"
-echo -e "${COLOR_RESTRICTED} Количество элементов плейлиста с ограниченным доступом: $RESTRICTED_COUNT${COLOR_RESET}"
-echo -e "${COLOR_DOWNLOADED} Всего элементов плейлиста скачано за весь сеанс: $REAL_NEW_COUNT${COLOR_RESET}"
+echo -e "${COLOR_SKIP}Количество пропущенных элементов плейлиста: $SKIPPED_COUNT${COLOR_RESET}"
+echo -e "Количество удаленных и скрытых элементов плейлиста: $DELETED_COUNT"
+echo -e "Количество элементов плейлиста с ограниченным доступом: $RESTRICTED_COUNT"
+echo -e "${COLOR_DOWNLOADED}Всего элементов плейлиста скачано за весь сеанс: $REAL_NEW_COUNT${COLOR_RESET}"
 echo -e "--------------------------------------------------------------------------------"
-echo -e " Времени затрачено: $FORMATTED_DOWNLOAD_TIME"
+echo -e "Времени затрачено: $FORMATTED_DOWNLOAD_TIME"
+echo -e "--------------------------------------------------------------------------------"
 
-if [ "$REAL_NEW_COUNT" -gt 0 ] && [ -s .downloaded_names.tmp ]; then
-    echo -e " Список скачанных элементов:"
-    cat -n .downloaded_names.tmp
+if [ "$REAL_NEW_COUNT" -gt 0 ] && [ -s "$DOWNLOADED_NAMES_FILE" ]; then
+    echo -e "Список скачанных элементов:"
+    echo -e ""
+    awk -F'\t' '{print NR " ID: " $1 " | " $2}' "$DOWNLOADED_NAMES_FILE"
+    echo -e ""
 else
     if [ "$REAL_NEW_COUNT" -eq 0 ]; then
         echo -e "${COLOR_STATUS} (Новых файлов добавлено не было, ваш плейлист полностью синхронизирован)${COLOR_RESET}"
     fi
 fi
 
-if [ -s "$PROBLEMATIC_LIST_FILE" ]; then
-    echo -e " Проблемные элементы плейлиста:"
-
-    DELETED_PROBLEMS=$(grep -vE "Private video|Sign in if you've been granted access" "$PROBLEMATIC_LIST_FILE" | sed '/^$/d' | wc -l | tr -d ' ')
-    RESTRICTED_PROBLEMS=$(grep -E "Private video|Sign in if you've been granted access" "$PROBLEMATIC_LIST_FILE" | sed '/^$/d' | wc -l | tr -d ' ')
-
-    if [ "$DELETED_PROBLEMS" -gt 0 ]; then
-        echo -e " [Удаленные и скрытые]"
-        grep -vE "Private video|Sign in if you've been granted access" "$PROBLEMATIC_LIST_FILE" | awk -F'\t' '{print "  " NR ". " $1 " | ID: " $2}'
-    fi
-
-    if [ "$RESTRICTED_PROBLEMS" -gt 0 ]; then
-        echo -e " [С ограниченным доступом]"
-        grep -E "Private video|Sign in if you've been granted access" "$PROBLEMATIC_LIST_FILE" | awk -F'\t' '{print "  " NR ". " $1 " | ID: " $2}'
-    fi
-
+if [ -s "$NOT_DOWNLOADED_FILE" ]; then
     echo -e "--------------------------------------------------------------------------------"
+    echo -e "Список элементов которые не были скачаны:"
+    echo -e ""
+    awk -F'\t' '{print NR " ID: " $1 " | Причина: " $2}' "$NOT_DOWNLOADED_FILE"
 fi
 
-rm -f .downloaded_names.tmp "$PROBLEMATIC_LIST_FILE"
+rm -f "$ANALYSIS_FILE" "$DOWNLOADED_NAMES_FILE" "$NOT_DOWNLOADED_FILE" "$CLEAN_LOG_FILE" "$BEFORE_ARCHIVE_FILE"
 
 echo -e "${COLOR_REPORT_FINAL}================================================================================${COLOR_RESET}"
