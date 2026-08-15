@@ -124,6 +124,8 @@ BEFORE_ARCHIVE_FILE="$SERVICE_DIR/.archive_before_sync.tmp"
 
 # Сохраняем индекс ID->название для красивых отчетов
 build_playlist_index "$PLAYLIST_INDEX_FILE"
+PLAYLIST_TOTAL_ITEMS=$(wc -l < "$PLAYLIST_INDEX_FILE" 2>/dev/null | tr -d ' ')
+PLAYLIST_TOTAL_ITEMS=${PLAYLIST_TOTAL_ITEMS:-0}
 
 # Создаем файл архива внутри новой папки, если его нет
 touch "$ARCHIVE_FILE"
@@ -316,14 +318,17 @@ REMOVED_INCOMPLETE_COUNT=0
 trap 'cleanup_and_exit INT' INT
 trap 'cleanup_and_exit TERM' TERM
 
-DOWNLOAD_START_TIME=$(date +%s)
+AUTO_RESTART_COUNT=0
 
-# 3. ЗАПУСК YT-DLP
-# Надёжный вариант: обёртка на Python, которая показывает live-вывод,
-# считает готовые треки, печатает промежуточный отчёт каждые 10 и
-# корректно обрабатывает Ctrl+C без докачивания полного плейлиста.
+while true; do
+    DOWNLOAD_START_TIME=$(date +%s)
 
-python3 - "$PLAYLIST_URL" "$LOG_FILE" "$ARCHIVE_FILE" "$BEFORE_COUNT" "$MUSIC_DIR" "$BROWSER" "$PLAYLIST_NAME" "$DOWNLOAD_START_TIME" <<'PY'
+    # 3. ЗАПУСК YT-DLP
+    # Надёжный вариант: обёртка на Python, которая показывает live-вывод,
+    # считает готовые треки, печатает промежуточный отчёт каждые 10 и
+    # корректно обрабатывает Ctrl+C без докачивания полного плейлиста.
+
+    python3 - "$PLAYLIST_URL" "$LOG_FILE" "$ARCHIVE_FILE" "$BEFORE_COUNT" "$MUSIC_DIR" "$BROWSER" "$PLAYLIST_NAME" "$DOWNLOAD_START_TIME" <<'PY'
 import os, sys, subprocess, signal, re, time
 from yt_dlp import YoutubeDL, parse_options
 
@@ -570,23 +575,12 @@ class OutputLogger:
         elif self.failure_re.search(clean_text):
             state['consecutive_failures'] += 1
             if state['consecutive_failures'] >= CONSECUTIVE_FAILURE_LIMIT:
-                stop_color = '\033[31m' if sys.stdout.isatty() else ''
-                stop_reset = '\033[0m' if sys.stdout.isatty() else ''
-                stop_message = (
-                    f'\n{stop_color}>>> [ОСТАНОВКА] {CONSECUTIVE_FAILURE_LIMIT} ошибок подряд (HTTP 403 / cookies устарели).'
-                    ' Похоже, YouTube отозвал сессию cookies. Скачивание остановлено, чтобы не терять часы'
-                    f' на заведомо неудачные попытки. Обновите cookies (перезайдите в аккаунт в Chrome) и запустите скрипт заново.{stop_reset}\n'
-                )
                 finish_progress_line()
-                sys.stdout.write(stop_message)
-                sys.stdout.flush()
-                log_handle.write(stop_message)
-                log_handle.flush()
                 try:
-                    ydl._exit_status = 2
+                    ydl._exit_status = 42
                 except Exception:
                     pass
-                raise SystemExit(2)
+                raise SystemExit(42)
 
     debug = _write
     info = _write
@@ -622,13 +616,31 @@ finally:
     except Exception:
         pass
 PY
-YT_EXIT=$?
+    YT_EXIT=$?
 
-if [ "$YT_EXIT" -eq 130 ]; then
-    if [ "$INTERRUPTED" -eq 0 ]; then
-        cleanup_incomplete_webm
+    if [ "$YT_EXIT" -eq 130 ]; then
+        if [ "$INTERRUPTED" -eq 0 ]; then
+            cleanup_incomplete_webm
+        fi
+        break
     fi
-fi
+
+    if [ "$YT_EXIT" -eq 42 ]; then
+        CURRENT_ARCHIVE_COUNT=$(wc -l < "$ARCHIVE_FILE" 2>/dev/null | tr -d ' ')
+        CURRENT_ARCHIVE_COUNT=${CURRENT_ARCHIVE_COUNT:-0}
+
+        if [ "$PLAYLIST_TOTAL_ITEMS" -gt 0 ] && [ "$CURRENT_ARCHIVE_COUNT" -ge "$PLAYLIST_TOTAL_ITEMS" ]; then
+            break
+        fi
+
+        AUTO_RESTART_COUNT=$((AUTO_RESTART_COUNT + 1))
+        echo -e "\n${COLOR_DELETED}>>> [НЕПРЕДВИДЕННОЕ ПРЕРЫВАНИЕ] Работа скрипта была неожиданно прервана.${COLOR_RESET}"
+        echo -e "${COLOR_DELETED}Автоматический перезапуск для продолжения загрузки до полного покрытия плейлиста (${CURRENT_ARCHIVE_COUNT}/${PLAYLIST_TOTAL_ITEMS}) (попытка ${AUTO_RESTART_COUNT})...${COLOR_RESET}"
+        continue
+    fi
+
+    break
+done
 
 # 4. АНАЛИЗ И МАТЕМАТИЧЕСКИЙ РАСЧЕТ ОТЧЕТА
 CLEAN_LOG_FILE=".sync_log_clean.tmp"
@@ -638,12 +650,12 @@ NOT_DOWNLOADED_FILE=".not_downloaded_items.tmp"
 
 sed -E 's/\x1B\[[0-9;]*[[:alpha:]]//g' "$LOG_FILE" > "$CLEAN_LOG_FILE"
 
-python3 - "$CLEAN_LOG_FILE" "$ARCHIVE_FILE" "$BEFORE_COUNT" "$PLAYLIST_INDEX_FILE" "$ANALYSIS_FILE" "$DOWNLOADED_NAMES_FILE" "$NOT_DOWNLOADED_FILE" "$BEFORE_ARCHIVE_FILE" "$INTERRUPTED" <<'PY'
+python3 - "$CLEAN_LOG_FILE" "$ARCHIVE_FILE" "$BEFORE_COUNT" "$PLAYLIST_INDEX_FILE" "$MUSIC_DIR" "$ANALYSIS_FILE" "$DOWNLOADED_NAMES_FILE" "$NOT_DOWNLOADED_FILE" "$BEFORE_ARCHIVE_FILE" "$INTERRUPTED" <<'PY'
 import re
 import sys
 from pathlib import Path
 
-clean_log_file, archive_file, before_count_str, playlist_index_file, analysis_file, downloaded_file, not_downloaded_file, before_archive_file, interrupted_str = sys.argv[1:10]
+clean_log_file, archive_file, before_count_str, playlist_index_file, music_dir, analysis_file, downloaded_file, not_downloaded_file, before_archive_file, interrupted_str = sys.argv[1:11]
 before_count = int(before_count_str)
 interrupted = interrupted_str == '1'
 
@@ -663,6 +675,16 @@ if index_path.exists():
             playlist_title_by_id[vid] = title
 
 downloaded_title_by_id = {}
+skipped_title_by_id = {}
+existing_title_by_id = {}
+music_path = Path(music_dir)
+if music_path.exists():
+    for file_path in music_path.iterdir():
+        if not file_path.is_file():
+            continue
+        match = re.match(r'^(.+?) \[([A-Za-z0-9_-]{11})\]\.[^.]+$', file_path.name)
+        if match and match.group(2) not in existing_title_by_id:
+            existing_title_by_id[match.group(2)] = match.group(1)
 error_by_id = {}
 error_lines_by_id = {}
 skipped_ids = set()
@@ -680,9 +702,10 @@ for raw in Path(clean_log_file).read_text(encoding='utf-8', errors='replace').sp
     if m_hidden:
         hidden_unavailable += int(m_hidden.group(1))
 
-    m_skip = re.match(r'^\[youtube\]\s+([A-Za-z0-9_-]{11}):.*has already been recorded in the archive', line)
+    m_skip = re.match(r'^\[download\]\s+([A-Za-z0-9_-]{11}):\s*(.*?)\s+has already been recorded in the archive$', line)
     if m_skip:
         skipped_ids.add(m_skip.group(1))
+        skipped_title_by_id[m_skip.group(1)] = m_skip.group(2).strip()
 
     m_dest = re.match(r'^\[ExtractAudio\] Destination:\s+.+/(.+?) \[([A-Za-z0-9_-]{11})\]\.mp3$', line)
     if m_dest:
@@ -735,8 +758,10 @@ before_ids = set(extract_ids(Path(before_archive_file)))
 after_ids_ordered = extract_ids(Path(archive_file))
 new_ids = [vid for vid in after_ids_ordered if vid not in before_ids]
 
-downloaded_names = [playlist_title_by_id.get(vid, f'Видео с ID {vid}') for vid in new_ids]
-downloaded_names = [f'{vid}\t{downloaded_title_by_id.get(vid, playlist_title_by_id.get(vid, f"Видео с ID {vid}"))}' for vid in new_ids]
+downloaded_names = [
+    f'{vid}\t{downloaded_title_by_id.get(vid, existing_title_by_id.get(vid, skipped_title_by_id.get(vid, playlist_title_by_id.get(vid, f"Видео с ID {vid}"))))}'
+    for vid in new_ids
+]
 real_new_count = len(new_ids)
 
 restricted_ids = [vid for vid, (category, _) in error_by_id.items() if category == 'restricted']
