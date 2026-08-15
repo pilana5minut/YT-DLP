@@ -462,6 +462,7 @@ state = {
     'last_reported': 0,
     'consecutive_failures': 0,
     'progress_line_active': False,
+    'awaiting_done_separator': False,
 }
 CONSECUTIVE_FAILURE_LIMIT = 5
 
@@ -497,18 +498,43 @@ def progress_hook(status):
     if download_status != 'finished':
         return
 
+    # Байты скачаны, но это ещё не конец элемента: впереди постобработка
+    # (ExtractAudio, embed thumbnail) и печать ">>> [ГОТОВО]" + разделителя.
+    # Подсчёт и отчёт переносим в _patched_to_stdout, который срабатывает
+    # уже после фактического вывода этих строк — иначе отчёт вклинивается
+    # посреди вывода по текущему элементу.
     finish_progress_line()
-    state['finished_count'] += 1
-    if state['finished_count'] >= state['last_reported'] + 10:
-        state['last_reported'] = (state['finished_count'] // 10) * 10
-        log_handle.flush()
-        report_stats(
-            log_file,
-            archive_file,
-            before_count,
-            start_time,
-            forced_new_count=state['finished_count'],
-        )
+
+
+# --print использует YoutubeDL.to_stdout напрямую, в обход logger'а,
+# поэтому перехватываем именно его, чтобы отчёт печатался строго после
+# того, как строки ">>> [ГОТОВО]" и разделитель реально попали в stdout.
+_original_to_stdout = YoutubeDL.to_stdout
+
+
+def _patched_to_stdout(self, message, *args, **kwargs):
+    _original_to_stdout(self, message, *args, **kwargs)
+
+    if message.startswith('>>> [ГОТОВО]'):
+        state['awaiting_done_separator'] = True
+        return
+
+    if message == '-' * 80 and state['awaiting_done_separator']:
+        state['awaiting_done_separator'] = False
+        state['finished_count'] += 1
+        if state['finished_count'] >= state['last_reported'] + 10:
+            state['last_reported'] = (state['finished_count'] // 10) * 10
+            log_handle.flush()
+            report_stats(
+                log_file,
+                archive_file,
+                before_count,
+                start_time,
+                forced_new_count=state['finished_count'],
+            )
+
+
+YoutubeDL.to_stdout = _patched_to_stdout
 
 
 ydl_params['progress_hooks'] = [progress_hook]
