@@ -457,14 +457,47 @@ cmd = [
 ]
 
 _, ydl_options, urls, ydl_params = parse_options(cmd[1:])
-state = {'finished_count': 0, 'last_reported': 0, 'consecutive_failures': 0}
+state = {
+    'finished_count': 0,
+    'last_reported': 0,
+    'consecutive_failures': 0,
+    'progress_line_active': False,
+}
 CONSECUTIVE_FAILURE_LIMIT = 5
 
 
+def finish_progress_line():
+    if state['progress_line_active']:
+        sys.stdout.write('\n')
+        sys.stdout.flush()
+        state['progress_line_active'] = False
+
+
 def progress_hook(status):
-    if status.get('status') != 'finished':
+    download_status = status.get('status')
+    if download_status == 'downloading' and sys.stdout.isatty():
+        downloaded_bytes = status.get('downloaded_bytes', 0)
+        total_bytes = status.get('total_bytes') or status.get('total_bytes_estimate')
+
+        if total_bytes:
+            percent = downloaded_bytes / total_bytes * 100
+            speed = status.get('speed')
+            eta = status.get('eta')
+            speed_text = f'{speed / 1024 / 1024:.2f}MiB/s' if speed else 'unknown speed'
+            eta_text = time.strftime('%M:%S', time.gmtime(eta)) if eta is not None else 'unknown ETA'
+            progress_line = (
+                f'[progress] yt-dlp {percent:.1f}% of {total_bytes / 1024 / 1024:.2f}MiB '
+                f'at {speed_text} ETA {eta_text}'
+            )
+            sys.stdout.write(f'\r\033[2K{progress_line}')
+            sys.stdout.flush()
+            state['progress_line_active'] = True
         return
 
+    if download_status != 'finished':
+        return
+
+    finish_progress_line()
     state['finished_count'] += 1
     if state['finished_count'] >= state['last_reported'] + 10:
         state['last_reported'] = (state['finished_count'] // 10) * 10
@@ -501,6 +534,7 @@ class OutputLogger:
         log_handle.flush()
 
         if any(pattern.search(text) for pattern in self.terminal_patterns):
+            finish_progress_line()
             sys.stdout.write(text + '\n')
             sys.stdout.flush()
 
@@ -517,6 +551,7 @@ class OutputLogger:
                     ' Похоже, YouTube отозвал сессию cookies. Скачивание остановлено, чтобы не терять часы'
                     f' на заведомо неудачные попытки. Обновите cookies (перезайдите в аккаунт в Chrome) и запустите скрипт заново.{stop_reset}\n'
                 )
+                finish_progress_line()
                 sys.stdout.write(stop_message)
                 sys.stdout.flush()
                 log_handle.write(stop_message)
