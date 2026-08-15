@@ -375,7 +375,7 @@ def report_stats(log_path, archive_path, before_total, sync_start_time, forced_n
                         elif re.search(r'(Video unavailable|no longer available because|This video is no longer available)', message):
                             category = 'deleted'
                         else:
-                            category = 'restricted'
+                            category = 'failed'
 
                         previous_category = error_by_id.get(video_id)
                         if previous_category is None or (previous_category == 'deleted' and category == 'restricted'):
@@ -386,6 +386,7 @@ def report_stats(log_path, archive_path, before_total, sync_start_time, forced_n
 
     restricted_count = sum(1 for category in error_by_id.values() if category == 'restricted')
     deleted_count = sum(1 for category in error_by_id.values() if category == 'deleted')
+    failed_count = sum(1 for category in error_by_id.values() if category == 'failed')
     restricted_count += max(hidden_unavailable_count - len(error_by_id), 0)
 
     total_items = 0
@@ -413,6 +414,7 @@ def report_stats(log_path, archive_path, before_total, sync_start_time, forced_n
     print(f' Количество пропущенных элементов плейлиста: {skipped_count}')
     print(f' Количество удаленных и скрытых элементов плейлиста: {deleted_count}')
     print(f' Количество элементов плейлиста с ограниченным доступом: {restricted_count}')
+    print(f' Количество элементов с ошибкой скачивания: {failed_count}')
     print(f' Всего элементов плейлиста скачано на текущий момент: {real_new_count}')
     print('-' * 80)
     print(f' Времени затрачено: {format_duration(time.time() - sync_start_time)}')
@@ -440,6 +442,9 @@ cmd = [
     '--fragment-retries', '10',
     '--extractor-args', 'youtubetab:skip=authcheck',
     '--http-chunk-size', '10M',
+    '--sleep-requests', '1',
+    '--sleep-interval', '3',
+    '--max-sleep-interval', '8',
     '--paths', music_dir,
     '--output', '%(title)s [%(id)s].%(ext)s',
     '--ignore-errors',
@@ -452,7 +457,8 @@ cmd = [
 ]
 
 _, ydl_options, urls, ydl_params = parse_options(cmd[1:])
-state = {'finished_count': 0, 'last_reported': 0}
+state = {'finished_count': 0, 'last_reported': 0, 'consecutive_failures': 0}
+CONSECUTIVE_FAILURE_LIMIT = 5
 
 
 def progress_hook(status):
@@ -484,7 +490,9 @@ class OutputLogger:
         re.compile(r'^\[download\] Downloading item '),
         re.compile(r'^>>> \[(СКАЧИВАНИЕ|ГОТОВО)\]'),
         re.compile(r'^\[ExtractAudio\] Destination:'),
+        re.compile(r'^(ERROR|WARNING):'),
     )
+    failure_re = re.compile(r'(HTTP Error 403: Forbidden|cookies are no longer valid)')
 
     def _write(self, message):
         text = str(message)
@@ -495,6 +503,29 @@ class OutputLogger:
         if any(pattern.search(text) for pattern in self.terminal_patterns):
             sys.stdout.write(text + '\n')
             sys.stdout.flush()
+
+        # youtube иногда отзывает cookies посреди сессии — дальше всё валится с 403
+        if '>>> [ГОТОВО]' in clean_text:
+            state['consecutive_failures'] = 0
+        elif self.failure_re.search(clean_text):
+            state['consecutive_failures'] += 1
+            if state['consecutive_failures'] >= CONSECUTIVE_FAILURE_LIMIT:
+                stop_color = '\033[31m' if sys.stdout.isatty() else ''
+                stop_reset = '\033[0m' if sys.stdout.isatty() else ''
+                stop_message = (
+                    f'\n{stop_color}>>> [ОСТАНОВКА] {CONSECUTIVE_FAILURE_LIMIT} ошибок подряд (HTTP 403 / cookies устарели).'
+                    ' Похоже, YouTube отозвал сессию cookies. Скачивание остановлено, чтобы не терять часы'
+                    f' на заведомо неудачные попытки. Обновите cookies (перезайдите в аккаунт в Chrome) и запустите скрипт заново.{stop_reset}\n'
+                )
+                sys.stdout.write(stop_message)
+                sys.stdout.flush()
+                log_handle.write(stop_message)
+                log_handle.flush()
+                try:
+                    ydl._exit_status = 2
+                except Exception:
+                    pass
+                raise SystemExit(2)
 
     debug = _write
     info = _write
@@ -572,9 +603,10 @@ if index_path.exists():
 
 downloaded_title_by_id = {}
 error_by_id = {}
+error_lines_by_id = {}
+skipped_ids = set()
 hidden_unavailable = 0
 total_items = 0
-skipped_archive = 0
 
 for raw in Path(clean_log_file).read_text(encoding='utf-8', errors='replace').splitlines():
     line = raw.strip()
@@ -587,14 +619,20 @@ for raw in Path(clean_log_file).read_text(encoding='utf-8', errors='replace').sp
     if m_hidden:
         hidden_unavailable += int(m_hidden.group(1))
 
-    if 'has already been recorded in the archive' in line:
-        skipped_archive += 1
+    m_skip = re.match(r'^\[youtube\]\s+([A-Za-z0-9_-]{11}):.*has already been recorded in the archive', line)
+    if m_skip:
+        skipped_ids.add(m_skip.group(1))
 
     m_dest = re.match(r'^\[ExtractAudio\] Destination:\s+.+/(.+?) \[([A-Za-z0-9_-]{11})\]\.mp3$', line)
     if m_dest:
         downloaded_title_by_id[m_dest.group(2)] = m_dest.group(1)
 
-    m_err = re.match(r'^ERROR: \[youtube\] ([^:]+):\s*(.*)$', line)
+    # запасной источник причины для сбоев, не привязанных к формату "[youtube] id:"
+    if line.startswith(('ERROR:', 'WARNING:')):
+        for token in re.findall(r'[A-Za-z0-9_-]{11}', line):
+            error_lines_by_id.setdefault(token, line.split(':', 1)[-1].strip())
+
+    m_err = re.match(r'^ERROR: \[youtube\] ([A-Za-z0-9_-]{11}):\s*(.*)$', line)
     if not m_err:
         continue
 
@@ -606,7 +644,7 @@ for raw in Path(clean_log_file).read_text(encoding='utf-8', errors='replace').sp
     elif deleted_re.search(msg):
         category = 'deleted'
     else:
-        category = 'restricted'
+        category = 'failed'
 
     prev = error_by_id.get(vid)
     if prev is None:
@@ -642,22 +680,32 @@ real_new_count = len(new_ids)
 
 restricted_ids = [vid for vid, (category, _) in error_by_id.items() if category == 'restricted']
 deleted_ids = [vid for vid, (category, _) in error_by_id.items() if category == 'deleted']
+explicit_failed_ids = [vid for vid, (category, _) in error_by_id.items() if category == 'failed']
 
 hidden_extra = max(hidden_unavailable - len(error_by_id), 0)
 restricted_count = len(restricted_ids) + hidden_extra
 deleted_count = len(deleted_ids)
 
-if total_items > 0 and not interrupted:
-    residual_skipped = max(total_items - real_new_count - deleted_count - restricted_count, 0)
-else:
-    residual_skipped = 0
-skipped_count = max(skipped_archive, residual_skipped)
+# честная сверка по ID: всё, что есть в индексе плейлиста, но не скачано,
+# не помечено архивным пропуском и не распознано как restricted/deleted —
+# это реальный сбой скачивания, а не "пропуск"
+playlist_ids_ordered = list(playlist_title_by_id.keys())
+accounted_ids = set(new_ids) | set(restricted_ids) | set(deleted_ids) | set(explicit_failed_ids) | skipped_ids
+failed_ids_from_index = [vid for vid in playlist_ids_ordered if vid not in accounted_ids]
+
+failed_count = len(explicit_failed_ids) + len(failed_ids_from_index)
+skipped_count = len(skipped_ids)
 
 Path(downloaded_file).write_text('\n'.join(downloaded_names) + ('\n' if downloaded_names else ''), encoding='utf-8')
 
 lines = []
 for vid, (category, reason) in sorted(error_by_id.items(), key=lambda x: x[0]):
     lines.append(f'{vid}\t{reason}')
+
+for vid in failed_ids_from_index:
+    title = playlist_title_by_id.get(vid, f'Видео с ID {vid}')
+    reason = error_lines_by_id.get(vid, 'Скачивание не завершено (загружена только обложка/метаданные); точная причина не зафиксирована в логе — см. Service_Files/sync_log.txt')
+    lines.append(f'{vid}\t{title} — {reason}')
 
 for idx in range(hidden_extra):
     lines.append(f'-\tYouTube: unavailable videos are hidden (скрытый недоступный элемент #{idx + 1})')
@@ -668,7 +716,8 @@ Path(analysis_file).write_text(
     f'REAL_NEW_COUNT={real_new_count}\n'
     f'DELETED_COUNT={deleted_count}\n'
     f'RESTRICTED_COUNT={restricted_count}\n'
-    f'SKIPPED_COUNT={skipped_count}\n',
+    f'SKIPPED_COUNT={skipped_count}\n'
+    f'FAILED_COUNT={failed_count}\n',
     encoding='utf-8'
 )
 PY
@@ -699,6 +748,7 @@ fi
 echo -e "${COLOR_SKIP}Количество пропущенных элементов плейлиста: $SKIPPED_COUNT${COLOR_RESET}"
 echo -e "Количество удаленных и скрытых элементов плейлиста: $DELETED_COUNT"
 echo -e "Количество элементов плейлиста с ограниченным доступом: $RESTRICTED_COUNT"
+echo -e "${COLOR_DELETED}Количество элементов с ошибкой скачивания: $FAILED_COUNT${COLOR_RESET}"
 echo -e "${COLOR_DOWNLOADED}Всего элементов плейлиста скачано за весь сеанс: $REAL_NEW_COUNT${COLOR_RESET}"
 echo -e "--------------------------------------------------------------------------------"
 echo -e "Времени затрачено: $FORMATTED_DOWNLOAD_TIME"
