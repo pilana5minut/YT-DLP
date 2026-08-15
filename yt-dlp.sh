@@ -95,7 +95,6 @@ if [ -t 1 ]; then
     COLOR_RESTRICTED='\033[33m' # Жёлтый
     COLOR_DOWNLOADED='\033[32m' # Зелёный
     COLOR_STATUS='\033[36m'    # Бирюзовый
-    COLOR_REPORT_INTERMEDIATE='\033[38;2;37;230;230m' # #25e6e6
     COLOR_REPORT_FINAL='\033[38;2;196;59;196m'       # #c43bc4
 else
     COLOR_RESET=''
@@ -104,7 +103,6 @@ else
     COLOR_RESTRICTED=''
     COLOR_DOWNLOADED=''
     COLOR_STATUS=''
-    COLOR_REPORT_INTERMEDIATE=''
     COLOR_REPORT_FINAL=''
 fi
 
@@ -143,131 +141,6 @@ echo -e " Рабочая директория: $PWD"
 echo -e " Элементы плейлиста сохраняются в: $MUSIC_DIR"
 echo -e " Логи и архив сохраняются в: $SERVICE_DIR"
 echo -e "================================================================================\n"
-
-print_intermediate_report() {
-    local log_file="$1"
-    local archive_file="$2"
-    local before_count="$3"
-    local report_name="${4:-ПРОМЕЖУТОЧНЫЙ ОТЧЕТ СИНХРОНИЗАЦИИ ПЛЕЙЛИСТА: $PLAYLIST_NAME}"
-    local progress_tmp=".progress_summary.tmp"
-
-    grep ">>> \[ГОТОВО\]" "$log_file" 2>/dev/null | sed "s/.*>>> \[ГОТОВО\] //" | sed -e 's/[[:space:]]*$//' > "$progress_tmp"
-
-    local downloaded_count=$(wc -l < "$progress_tmp" | tr -d ' ')
-    local after_count=$(wc -l < "$archive_file" 2>/dev/null | tr -d ' ')
-    local new_archive_count=$((after_count - before_count))
-    if [ "$new_archive_count" -gt "$downloaded_count" ]; then
-        local real_new_count=$new_archive_count
-    else
-        local real_new_count=$downloaded_count
-    fi
-
-    local clean_log_file=".intermediate_sync_log_clean.tmp"
-    sed -E 's/\x1B\[[0-9;]*[[:alpha:]]//g' "$log_file" > "$clean_log_file"
-
-    local stats
-    stats=$(python3 - "$clean_log_file" "$real_new_count" <<'PY'
-import re
-import sys
-
-log_path, real_new_count_str = sys.argv[1:3]
-real_new_count = int(real_new_count_str)
-
-restricted_re = re.compile(r'(not made this video available in your country|This video is not available in your country|blocked due to the claimed content|Private video|Sign in if you\'ve been granted access|This video is not available)')
-deleted_re = re.compile(r'(Video unavailable|no longer available because|This video is no longer available)')
-
-error_by_id = {}
-hidden_unavailable = 0
-skipped_archive = 0
-total_items = 0
-
-with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
-    for raw in f:
-        line = raw.strip()
-        m_total = re.search(r'Downloading\s+(\d+)\s+items', line)
-        if m_total:
-            total_items = int(m_total.group(1))
-
-        m_hidden = re.search(r'INFO\s+-\s+(\d+)\s+unavailable videos are hidden', line)
-        if m_hidden:
-            hidden_unavailable += int(m_hidden.group(1))
-
-        if 'has already been recorded in the archive' in line:
-            skipped_archive += 1
-
-        m_err = re.match(r'^ERROR: \[youtube\] ([^:]+):\s*(.*)$', line)
-        if not m_err:
-            continue
-
-        vid = m_err.group(1).strip()
-        msg = m_err.group(2).strip()
-        if restricted_re.search(msg):
-            category = 'restricted'
-        elif deleted_re.search(msg):
-            category = 'deleted'
-        else:
-            category = 'restricted'
-
-        prev = error_by_id.get(vid)
-        if prev is None or (prev == 'deleted' and category == 'restricted'):
-            error_by_id[vid] = category
-
-restricted_ids = sum(1 for c in error_by_id.values() if c == 'restricted')
-deleted_ids = sum(1 for c in error_by_id.values() if c == 'deleted')
-hidden_extra = max(hidden_unavailable - len(error_by_id), 0)
-restricted_count = restricted_ids + hidden_extra
-deleted_count = deleted_ids
-
-skipped_count = skipped_archive
-
-print(f'{skipped_count}|{deleted_count}|{restricted_count}')
-PY
-)
-
-local skipped_count deleted_count restricted_count
-IFS='|' read -r skipped_count deleted_count restricted_count <<< "$stats"
-
-    echo -e "\n================================================================================"
-    echo -e "${COLOR_REPORT_INTERMEDIATE} $report_name${COLOR_RESET}"
-    echo -e "================================================================================"
-    echo -e "${COLOR_SKIP} Количество пропущенных элементов плейлиста: $skipped_count${COLOR_RESET}"
-    echo -e "--------------------------------------------------------------------------------"
-    echo -e "${COLOR_DELETED} Количество удаленных и скрытых элементов плейлиста: $deleted_count${COLOR_RESET}"
-    echo -e "--------------------------------------------------------------------------------"
-    echo -e "${COLOR_RESTRICTED} Количество элементов плейлиста с ограниченным доступом: $restricted_count${COLOR_RESET}"
-    echo -e "--------------------------------------------------------------------------------"
-    echo -e "${COLOR_DOWNLOADED} Всего элементов плейлиста скачано за текущий сеанс: $real_new_count${COLOR_RESET}"
-    echo -e "--------------------------------------------------------------------------------"
-
-    rm -f "$progress_tmp" "$clean_log_file"
-}
-
-monitor_download_progress() {
-    local last_reported=0
-
-    while kill -0 "$YT_PID" 2>/dev/null; do
-        local current_downloaded
-        current_downloaded=$(grep -c ">>> \[ГОТОВО\]" "$LOG_FILE" 2>/dev/null || true)
-        current_downloaded=${current_downloaded//[[:space:]]/}
-        current_downloaded=${current_downloaded:-0}
-
-        if [ "$current_downloaded" -ge $((last_reported + 10)) ]; then
-            last_reported=$((current_downloaded / 10 * 10))
-            print_intermediate_report "$LOG_FILE" "$ARCHIVE_FILE" "$BEFORE_COUNT" "ПРОМЕЖУТОЧНЫЙ ОТЧЕТ СИНХРОНИЗАЦИИ ПЛЕЙЛИСТА: $PLAYLIST_NAME"
-        fi
-
-        sleep 2
-    done
-
-    local final_downloaded
-    final_downloaded=$(grep -c ">>> \[ГОТОВО\]" "$LOG_FILE" 2>/dev/null || true)
-    final_downloaded=${final_downloaded//[[:space:]]/}
-    final_downloaded=${final_downloaded:-0}
-
-    if [ "$final_downloaded" -gt "$last_reported" ] && [ $((final_downloaded % 10)) -ne 0 ]; then
-        print_intermediate_report "$LOG_FILE" "$ARCHIVE_FILE" "$BEFORE_COUNT" "ПРОМЕЖУТОЧНЫЙ ОТЧЕТ СИНХРОНИЗАЦИИ ПЛЕЙЛИСТА: $PLAYLIST_NAME"
-    fi
-}
 
 cleanup_incomplete_webm() {
     local file_name video_id removed_count=0
@@ -324,108 +197,15 @@ while true; do
     DOWNLOAD_START_TIME=$(date +%s)
 
     # 3. ЗАПУСК YT-DLP
-    # Надёжный вариант: обёртка на Python, которая показывает live-вывод,
-    # считает готовые треки, печатает промежуточный отчёт каждые 10 и
-    # корректно обрабатывает Ctrl+C без докачивания полного плейлиста.
+    # Надёжный вариант: обёртка на Python, которая показывает live-вывод
+    # и корректно обрабатывает Ctrl+C без докачивания полного плейлиста.
 
-    python3 - "$PLAYLIST_URL" "$LOG_FILE" "$ARCHIVE_FILE" "$BEFORE_COUNT" "$MUSIC_DIR" "$BROWSER" "$PLAYLIST_NAME" "$DOWNLOAD_START_TIME" <<'PY'
-import os, sys, subprocess, signal, re, time
+    python3 - "$PLAYLIST_URL" "$LOG_FILE" "$ARCHIVE_FILE" "$MUSIC_DIR" "$BROWSER" <<'PY'
+import sys, signal, re, time
 from yt_dlp import YoutubeDL, parse_options
 
-playlist_url, log_file, archive_file, before_count_str, music_dir, browser, playlist_name, start_time_str = sys.argv[1:9]
-before_count = int(before_count_str)
-start_time = int(start_time_str)
+playlist_url, log_file, archive_file, music_dir, browser = sys.argv[1:6]
 ansi_re = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
-
-
-def format_duration(total_seconds):
-    hours, remainder = divmod(int(total_seconds), 3600)
-    minutes, seconds = divmod(remainder, 60)
-    return f'{hours:02d}:{minutes:02d}:{seconds:02d}'
-
-
-def report_stats(log_path, archive_path, before_total, sync_start_time, forced_new_count=None):
-    names = []
-    if os.path.exists(log_path):
-        with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
-            for line in f:
-                clean_line = ansi_re.sub('', line)
-                if '>>> [ГОТОВО]' in clean_line:
-                    names.append(clean_line.split('>>> [ГОТОВО] ', 1)[1].strip())
-
-    downloaded_count = len(names)
-    if os.path.exists(archive_path):
-        with open(archive_path, 'r', encoding='utf-8', errors='replace') as f:
-            after_count = sum(1 for line in f if line.strip())
-    else:
-        after_count = 0
-
-    real_new_count = max(after_count - before_total, downloaded_count)
-    if forced_new_count is not None and forced_new_count > real_new_count:
-        real_new_count = forced_new_count
-
-    error_by_id = {}
-    hidden_unavailable_count = 0
-    if os.path.exists(log_path):
-        with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
-            for line in f:
-                clean_line = ansi_re.sub('', line)
-                if 'ERROR: [youtube]' in clean_line:
-                    match = re.match(r'^ERROR: \[youtube\] ([^:]+):\s*(.*)$', clean_line)
-                    if match:
-                        video_id = match.group(1).strip()
-                        message = match.group(2).strip()
-                        if re.search(r'(not made this video available in your country|This video is not available in your country|blocked due to the claimed content|Private video|Sign in if you\'ve been granted access|This video is not available)', message):
-                            category = 'restricted'
-                        elif re.search(r'(Video unavailable|no longer available because|This video is no longer available)', message):
-                            category = 'deleted'
-                        else:
-                            category = 'failed'
-
-                        previous_category = error_by_id.get(video_id)
-                        if previous_category is None or (previous_category == 'deleted' and category == 'restricted'):
-                            error_by_id[video_id] = category
-                m_hidden = re.search(r'INFO\s+-\s+(\d+)\s+unavailable videos are hidden', clean_line)
-                if m_hidden:
-                    hidden_unavailable_count += int(m_hidden.group(1))
-
-    restricted_count = sum(1 for category in error_by_id.values() if category == 'restricted')
-    deleted_count = sum(1 for category in error_by_id.values() if category == 'deleted')
-    failed_count = sum(1 for category in error_by_id.values() if category == 'failed')
-    restricted_count += max(hidden_unavailable_count - len(error_by_id), 0)
-
-    total_items = 0
-    if os.path.exists(log_path):
-        with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
-            for line in f:
-                clean_line = ansi_re.sub('', line)
-                m = re.search(r'Downloading\s+(\d+)\s+items', clean_line)
-                if m:
-                    total_items = int(m.group(1))
-
-    skipped_count = 0
-    if os.path.exists(log_path):
-        with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
-            for line in f:
-                clean_line = ansi_re.sub('', line)
-                if 'has already been recorded in the archive' in clean_line:
-                    skipped_count += 1
-
-    report_color = '\033[38;2;37;230;230m' if sys.stdout.isatty() else ''
-    reset_color = '\033[0m' if sys.stdout.isatty() else ''
-    print('\n' + f'{report_color}{"=" * 80}{reset_color}')
-    print(f'{report_color} ПРОМЕЖУТОЧНЫЙ ОТЧЕТ СИНХРОНИЗАЦИИ ПЛЕЙЛИСТА: {playlist_name}{reset_color}')
-    print(f'{report_color}{"=" * 80}{reset_color}')
-    print(f' Количество пропущенных элементов плейлиста: {skipped_count}')
-    print(f' Количество удаленных и скрытых элементов плейлиста: {deleted_count}')
-    print(f' Количество элементов плейлиста с ограниченным доступом: {restricted_count}')
-    print(f' Количество элементов с ошибкой скачивания: {failed_count}')
-    print(f' Всего элементов плейлиста скачано на текущий момент: {real_new_count}')
-    print('-' * 80)
-    print(f' Времени затрачено: {format_duration(time.time() - sync_start_time)}')
-    print(f'{report_color}{"=" * 80}{reset_color}')
-    print('')
-
 
 cmd = [
     'yt-dlp',
@@ -463,11 +243,8 @@ cmd = [
 
 _, ydl_options, urls, ydl_params = parse_options(cmd[1:])
 state = {
-    'finished_count': 0,
-    'last_reported': 0,
     'consecutive_failures': 0,
     'progress_line_active': False,
-    'awaiting_done_separator': False,
 }
 CONSECUTIVE_FAILURE_LIMIT = 5
 
@@ -509,37 +286,6 @@ def progress_hook(status):
     # уже после фактического вывода этих строк — иначе отчёт вклинивается
     # посреди вывода по текущему элементу.
     finish_progress_line()
-
-
-# --print использует YoutubeDL.to_stdout напрямую, в обход logger'а,
-# поэтому перехватываем именно его, чтобы отчёт печатался строго после
-# того, как строки ">>> [ГОТОВО]" и разделитель реально попали в stdout.
-_original_to_stdout = YoutubeDL.to_stdout
-
-
-def _patched_to_stdout(self, message, *args, **kwargs):
-    _original_to_stdout(self, message, *args, **kwargs)
-
-    if message.startswith('>>> [ГОТОВО]'):
-        state['awaiting_done_separator'] = True
-        return
-
-    if message == '-' * 80 and state['awaiting_done_separator']:
-        state['awaiting_done_separator'] = False
-        state['finished_count'] += 1
-        if state['finished_count'] >= state['last_reported'] + 10:
-            state['last_reported'] = (state['finished_count'] // 10) * 10
-            log_handle.flush()
-            report_stats(
-                log_file,
-                archive_file,
-                before_count,
-                start_time,
-                forced_new_count=state['finished_count'],
-            )
-
-
-YoutubeDL.to_stdout = _patched_to_stdout
 
 
 ydl_params['progress_hooks'] = [progress_hook]
